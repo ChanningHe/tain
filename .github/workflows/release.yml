@@ -1,0 +1,248 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.2.0). Must match Cargo.toml."
+        required: true
+        type: string
+      dry_run:
+        description: "Build everything but push no image and publish no release."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.88"
+  CARGO_TERM_COLOR: always
+  # Always "false" on tag pushes, where `inputs.dry_run` is empty.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+jobs:
+  gate:
+    name: fmt + clippy + test gate (nix, both feature configs)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve + validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          RAW="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${RAW#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$RAW' is not a semver version (vX.Y.Z[-pre])"
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::version $VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *) PRERELEASE=false ;;
+          esac
+          {
+            echo "version=$VERSION"
+            echo "tag=v$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: cargo fmt --check
+        run: nix develop --command cargo fmt --check
+      - name: cargo clippy (default features)
+        run: nix develop --command cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo clippy (no default features)
+        run: nix develop --command cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      - name: cargo test (default features)
+        run: nix develop --command cargo test --locked
+      - name: cargo test (no default features)
+        run: nix develop --command cargo test --locked --no-default-features
+
+  # Built from the Dockerfile's `binary` stage so tarballs and image share one toolchain.
+  binaries:
+    name: build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            asset: tain-linux-amd64
+          - platform: linux/arm64
+            asset: tain-linux-arm64
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build static binary
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: binary
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=bin-out
+          build-args: |
+            RUST_VERSION=${{ env.RUST_VERSION }}
+          cache-from: type=gha,scope=${{ matrix.asset }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.asset }}
+
+      - name: Package tarball
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          BIN="bin-out/tain"
+          test -x "$BIN"
+          mkdir -p "dist-out/$ASSET"
+          cp "$BIN" "dist-out/$ASSET/tain"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist-out/$ASSET/"
+          cp -r dist/systemd "dist-out/$ASSET/"
+          (cd dist-out && tar czf "$ASSET.tar.gz" "$ASSET")
+          (cd dist-out && sha256sum "$ASSET.tar.gz" > "$ASSET.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          if-no-files-found: error
+          path: |
+            dist-out/${{ matrix.asset }}.tar.gz
+            dist-out/${{ matrix.asset }}.tar.gz.sha256
+
+  # Packages the exact binary from the amd64 tarball instead of rebuilding.
+  deb:
+    name: build .deb
+    runs-on: ubuntu-latest
+    needs: binaries
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: tain-linux-amd64
+          path: bin-in
+      - name: Stage binary where cargo-deb expects it
+        run: |
+          tar xzf bin-in/tain-linux-amd64.tar.gz -C bin-in
+          install -D -m 755 bin-in/tain-linux-amd64/tain target/x86_64-unknown-linux-musl/release/tain
+      - run: cargo install --locked cargo-deb --version 3.8.0
+      # With --target, cargo-deb maps `target/release/` assets to the staged path.
+      - run: cargo deb --no-build --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tain-deb
+          if-no-files-found: error
+          path: target/x86_64-unknown-linux-musl/debian/*.deb
+
+  docker:
+    name: docker buildx (amd64 + arm64)
+    runs-on: ubuntu-latest
+    needs: [gate, binaries]
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Registry paths must be lowercase; github.repository may not be.
+      - name: Compute image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # Tags: X.Y.Z, X.Y, X and latest. Prereleases get only X.Y.Z-pre.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.gate.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.gate.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.gate.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.gate.outputs.prerelease != 'true' }}
+          labels: |
+            org.opencontainers.image.title=tain
+            org.opencontainers.image.description=General-purpose repository mirror sync framework (APT backend)
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Login to GHCR
+        if: env.DRY_RUN != 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Buildx build (+ push unless dry run)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.DRY_RUN != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUST_VERSION=${{ env.RUST_VERSION }}
+          # Reuse the build-stage layers the binaries job just cached.
+          cache-from: |
+            type=gha,scope=tain-linux-amd64
+            type=gha,scope=tain-linux-arm64
+            type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
+
+  publish:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [gate, binaries, deb, docker]
+    permissions:
+      contents: write   # create GitHub Release + upload assets
+    # Job-level `if` cannot read env.DRY_RUN; inputs.dry_run is empty on tag pushes.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist-out
+      - name: List downloaded artifacts
+        run: find dist-out -type f | sort
+
+      # Explicit tag so manual runs (ref = branch) work; created at target_commitish if missing.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ needs.gate.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            dist-out/tain-linux-amd64/tain-linux-amd64.tar.gz
+            dist-out/tain-linux-amd64/tain-linux-amd64.tar.gz.sha256
+            dist-out/tain-linux-arm64/tain-linux-arm64.tar.gz
+            dist-out/tain-linux-arm64/tain-linux-arm64.tar.gz.sha256
+            dist-out/tain-deb/*.deb

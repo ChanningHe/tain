@@ -1,0 +1,24 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Suite: bookworm
+Codename: bookworm
+Origin: TainTest
+Architectures: amd64
+Components: main
+Date: Wed, 01 Jan 2020 00:00:00 UTC
+SHA256:
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855            0 dummy
+
+-----BEGIN PGP SIGNATURE-----
+
+iQFPBAEBCAA5FiEELb1Mq3LhCS5Gscav+iHNz2llaeAFAl4L4QAbFIAAAAAABAAO
+bWFudTIsMi41KzEuMTIsMCwzAAoJEPohzc9pZWngoeMIAJNxowebR8WL8wiUX6l6
+z2/qeeBMhoxuVaowl4f9JIIT8AIODzhMwOLYeW6tSOLJsyulr5vzSl9pt1+H9cTE
+K3Xbtzern+ueF97omC/U+SlYqEb+Q0ExDmUAO/q9H6dQy32khgBSTU1R/vAgF9So
+3JIIDxEuTj1hTFZCc1L3bR7472kTUjzO6npx58qEXzYi2A8U23V/AXvOotafVMRO
+nPx+qIdU6jPJoprS2/G776wHWnqt8e9f1VYGP1EXv+4hVCFu52vgbIeq31MIn4aB
+ojuMcYu3FQjXqpUzqq8oO7JIKhRh9w/fqrqEgNnjXDHTWSt0y2LK/S5bL0tr+r3i
+EzQ=
+=+wzZ
+-----END PGP SIGNATURE-----

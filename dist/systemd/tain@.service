@@ -1,0 +1,30 @@
+[Unit]
+Description=Tain APT mirror sync (%i, oneshot)
+Documentation=https://github.com/channinghe/tain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tain
+Group=tain
+# Per-instance config: /etc/tain/<instance>.toml
+ExecStart=/usr/bin/tain sync --config /etc/tain/%i.toml
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ReadWritePaths=/srv/mirrors
+
+IOSchedulingClass=idle
+Nice=10

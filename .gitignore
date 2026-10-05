@@ -1,0 +1,15 @@
+# Rust
+/target/
+
+# Nix / direnv
+.direnv/
+result
+result-*
+
+# Editor / OS
+.DS_Store
+
+# Private local files; never commit
+/dev/
+/CLAUDE.md
+/.claude/

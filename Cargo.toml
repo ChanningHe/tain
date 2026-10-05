@@ -1,0 +1,103 @@
+[package]
+name = "tain"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "General-purpose repository mirror sync framework"
+license = "MIT"
+repository = "https://github.com/channinghe/tain"
+authors = ["ChanningHe"]
+keywords = ["mirror", "apt", "repository", "sync"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tain"
+path = "src/main.rs"
+
+[lib]
+name = "tain"
+path = "src/lib.rs"
+
+[features]
+default = ["pgp"]
+# rpgp signature verification (pure Rust, keeps musl builds C-free).
+# Without it, suites whose `verify.pgp` needs a signature check fail at sync time.
+pgp = ["dep:pgp"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+bzip2 = "0.5"
+bytesize = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+croner = "3"
+flate2 = "1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+humantime = "2"
+humantime-serde = "1"
+md-5 = "0.10"
+pgp = { version = "0.20", optional = true, default-features = false }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "http2",
+  "stream",
+  "charset",
+] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "test-util", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+url = { version = "2", features = ["serde"] }
+xz2 = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+  "fmt",
+  "json",
+  "env-filter",
+  "smallvec",
+  "ansi",
+] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+fastrand = "2"
+libc = "0.2"
+tower-http = { version = "0.6", features = ["fs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Runtime deps are minimal: the binary is static (musl + rustls).
+[package.metadata.deb]
+maintainer = "Channing He <channinghey@gmail.com>"
+copyright = "2026 Channing He"
+extended-description = """\
+Tain is a general-purpose repository mirror sync framework written in
+Rust. APT is the supported backend. See README.md for the operator
+playbook.
+"""
+depends = "ca-certificates, tzdata, adduser"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/tain", "usr/bin/", "755"],
+    ["dist/systemd/tain-sync.service",   "usr/lib/systemd/system/", "644"],
+    ["dist/systemd/tain-sync.timer",     "usr/lib/systemd/system/", "644"],
+    ["dist/systemd/tain-daemon.service", "usr/lib/systemd/system/", "644"],
+    ["dist/systemd/tain@.service",       "usr/lib/systemd/system/", "644"],
+    ["dist/systemd/README.md",           "usr/share/doc/tain/systemd.md", "644"],
+    ["docs/configuration.md",            "usr/share/doc/tain/CONFIGURATION.md", "644"],
+    ["README.md",                        "usr/share/doc/tain/README.md", "644"],
+]
+maintainer-scripts = "dist/deb/"
+# No `conf-files`: /etc/tain/config.toml is not shipped; postinst creates it
+# and postrm removes it on purge.

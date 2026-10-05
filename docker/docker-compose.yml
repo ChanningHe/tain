@@ -1,0 +1,47 @@
+# Two examples: `tain-proxmox` (one upstream via env vars) and `tain-multi`
+# (several upstreams from a mounted TOML config). Adjust image tag, `user:`, volumes.
+# On stop the daemon finishes its in-flight sync; a kill after stop_grace_period
+# is safe, since an interrupted sync never touches the published tree.
+
+services:
+  tain-proxmox:
+    image: ghcr.io/channinghe/tain:latest
+    command: ["daemon"]
+    # The host data dir must be owned by this uid; the image does no chown.
+    user: "1000:1000"
+    environment:
+      TAIN_URL: "http://download.proxmox.com/debian/pve"
+      TAIN_DISTS: "bookworm|pve-no-subscription|amd64"
+      TAIN_GC: "1"
+      # Container local time: UTC unless TZ is set (e.g. TZ: "Europe/Berlin").
+      TAIN_SCHEDULE: "20 23,6,12,20 * * *"
+    volumes:
+      - ./mirrors-data/proxmox:/data
+    restart: unless-stopped
+    stop_grace_period: 5m
+    healthcheck:
+      test: ["CMD", "tain", "status", "--healthy-within", "48h"]
+      # The first full sync of a fresh mirror can take hours.
+      start_period: 24h
+      interval: 5m
+      timeout: 10s
+      retries: 3
+
+  # Cadence comes from `global.schedule` in the config.
+  tain-multi:
+    image: ghcr.io/channinghe/tain:latest
+    command: ["daemon"]
+    user: "1000:1000"
+    environment:
+      TAIN_CONFIG: "/config/tain.toml"
+    volumes:
+      - ./mirrors-data:/data
+      - ./config:/config:ro
+    restart: unless-stopped
+    stop_grace_period: 5m
+    healthcheck:
+      test: ["CMD", "tain", "status", "--healthy-within", "48h"]
+      start_period: 24h
+      interval: 5m
+      timeout: 10s
+      retries: 3

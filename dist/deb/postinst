@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+if ! getent passwd tain >/dev/null; then
+    adduser --system --group --home /srv/mirrors --no-create-home \
+        --shell /usr/sbin/nologin \
+        --gecos "Tain APT mirror sync" tain
+fi
+
+# Only when missing: re-applying owner/mode on every configure would clobber
+# operator changes. A fresh install onto an existing dir (pre-mounted disk,
+# reinstall after purge) only chowns it.
+if [ ! -d /srv/mirrors ]; then
+    install -d -o tain -g tain -m 0755 /srv/mirrors
+elif [ "${1:-}" = configure ] && [ -z "${2:-}" ]; then
+    chown tain:tain /srv/mirrors
+fi
+[ -d /etc/tain ] || install -d -o root -g tain -m 0750 /etc/tain
+
+if [ ! -f /etc/tain/config.toml ]; then
+    cat > /etc/tain/config.toml <<'EOF'
+# Tain example config — edit to taste. Full docs: /usr/share/doc/tain/CONFIGURATION.md
+[global]
+target = "/srv/mirrors"
+parallel = 32
+host_connections = 8
+
+# Uncomment + fill in per-mirror sections:
+# [[mirror]]
+# name = "debian"
+# url = "https://deb.debian.org/debian"
+# suites = ["bookworm", "bookworm-updates"]
+# components = ["main"]
+# architectures = ["amd64"]
+EOF
+    chown root:tain /etc/tain/config.toml
+    chmod 0640 /etc/tain/config.toml
+fi
+
+if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
+    systemctl daemon-reload || true
+    echo "tain: pick one of the two supported shapes:"
+    echo "  systemctl enable --now tain-sync.timer     # systemd-managed cadence"
+    echo "  systemctl enable --now tain-daemon.service # built-in croner scheduler"
+    echo "tain: set global.schedule in /etc/tain/config.toml (or TAIN_SCHEDULE) before"
+    echo "      enabling tain-daemon.service — missing schedule exits 2."
+fi
+
+exit 0

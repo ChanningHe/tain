@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = "remove" ] && ([ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]); then
+    systemctl stop tain-sync.timer 2>/dev/null || true
+    systemctl stop tain-daemon.service 2>/dev/null || true
+    systemctl disable tain-sync.timer 2>/dev/null || true
+    systemctl disable tain-daemon.service 2>/dev/null || true
+fi
+
+exit 0

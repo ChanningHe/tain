@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt-clippy:
+    name: fmt + clippy (both feature configs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: cargo fmt --check
+        run: nix develop --command cargo fmt --check
+      - name: cargo clippy (default features)
+        run: nix develop --command cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo clippy (no default features)
+        run: nix develop --command cargo clippy --all-targets --no-default-features --locked -- -D warnings
+
+  test-linux-amd64:
+    name: test (linux-amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: cargo test (default features)
+        run: nix develop --command cargo test --locked
+      - name: cargo test (no default features)
+        run: nix develop --command cargo test --locked --no-default-features
+
+  check-cross-arm64:
+    name: cross-check (linux-arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: cargo check --target aarch64-unknown-linux-gnu
+        run: nix develop .#cross-aarch64-linux --command cargo check --target aarch64-unknown-linux-gnu --locked

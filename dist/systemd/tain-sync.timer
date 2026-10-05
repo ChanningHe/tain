@@ -1,0 +1,13 @@
+[Unit]
+Description=Scheduled Tain APT mirror sync
+Documentation=https://github.com/channinghe/tain
+
+[Timer]
+# Randomized delay keeps multiple mirrors from hitting upstream in the same minute.
+OnCalendar=*-*-* 02,08,14,20:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=tain-sync.service
+
+[Install]
+WantedBy=timers.target

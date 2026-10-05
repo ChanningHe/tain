@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+    purge)
+        # Debian policy §6.5/§11.7: purge removes what postinst created.
+        rm -rf /etc/tain
+        if getent passwd tain >/dev/null 2>&1; then
+            deluser --system tain 2>/dev/null || userdel tain 2>/dev/null || true
+        fi
+        if getent group tain >/dev/null 2>&1; then
+            delgroup --system tain 2>/dev/null || groupdel tain 2>/dev/null || true
+        fi
+        # /srv/mirrors is mirror data and is kept on purge.
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

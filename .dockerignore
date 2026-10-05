@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.claude/
+dev/
+docs/
+docker/
+*.md
+.envrc
+.direnv/
+result
+result-*

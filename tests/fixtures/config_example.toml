@@ -1,0 +1,43 @@
+# Documented config example; acceptance fixture for tests/config_fixtures.rs.
+# Do not edit to make tests pass — fix the code or the docs.
+
+[global]
+target = "/data"
+parallel = 16
+log_level = "info"           # or a filter such as "info,tain::core=debug"
+log_format = "text"          # text | json
+schedule = "0 2,8,14,20 * * *"  # daemon mode only
+
+[global.retry]
+count = 3
+index_rounds = 5
+
+[defaults]                    # defaults for every mirror; each mirror may override
+architectures = ["amd64"]
+gc = { enabled = true, grace_period = "72h", max_delete_ratio = 0.3 }
+verify = { pgp = "off" }
+
+[[mirror]]
+name = "debian"
+backend = "apt"                 # default, may be omitted
+url = "https://deb.debian.org/debian"
+suites = ["bookworm", "bookworm-updates", "bookworm-backports"]
+components = ["main", "contrib", "non-free", "non-free-firmware"]
+architectures = ["amd64", "arm64"]
+[mirror.indexes]
+contents = true
+i18n = ["en", "zh"]          # true = all languages, false = none, array = allowlist
+dep11 = true
+cnf = true
+sources = false
+debian_installer = false     # d-i Packages + installer-<arch>/ images
+[mirror.verify]
+pgp = "required"             # off | if-present | required
+keyring = "/usr/share/keyrings/debian-archive-keyring.gpg"  # required unless pgp = "off"
+
+[[mirror]]
+name = "proxmox"
+url = "http://download.proxmox.com/debian/pve"
+suites = ["bookworm"]
+components = ["pve-no-subscription"]
+

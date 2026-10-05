@@ -1,0 +1,47 @@
+[Unit]
+Description=Tain APT mirror daemon (built-in scheduler)
+Documentation=https://github.com/channinghe/tain
+After=network-online.target
+Wants=network-online.target
+# Give up after 5 crash-restarts in 10 min (these belong in [Unit]).
+StartLimitBurst=5
+StartLimitIntervalSec=10min
+
+# Use tain-sync.timer instead for systemd-managed cadence.
+
+[Service]
+Type=exec
+User=tain
+Group=tain
+ExecStart=/usr/bin/tain daemon --config /etc/tain/config.toml
+# Reload re-reads the config; a bad config keeps the previous one live.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=30s
+
+# SIGTERM lets an in-flight sync finish; a kill after the timeout is safe
+# because staging never touches the published tree.
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ReadWritePaths=/srv/mirrors
+
+# --- Resource footprint ---
+IOSchedulingClass=idle
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

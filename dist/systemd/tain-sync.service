@@ -1,0 +1,35 @@
+[Unit]
+Description=Tain APT mirror sync (oneshot)
+Documentation=https://github.com/channinghe/tain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tain
+Group=tain
+ExecStart=/usr/bin/tain sync --config /etc/tain/config.toml
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+# Adjust ReadWritePaths to where your mirror actually lives.
+ReadWritePaths=/srv/mirrors
+
+# --- Resource footprint ---
+IOSchedulingClass=idle
+Nice=10
+
+# Exit codes: 0 ok, 1 partial, 2 config error, 3 lock held, 4 fatal I/O.
+# 1 and 3 are usually retryable; 2 and 4 need operator attention.
+SuccessExitStatus=0
