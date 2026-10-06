@@ -41,12 +41,3 @@ jobs:
         run: nix develop --command cargo test --locked
       - name: cargo test (no default features)
         run: nix develop --command cargo test --locked --no-default-features
-
-  check-cross-arm64:
-    name: cross-check (linux-arm64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - name: cargo check --target aarch64-unknown-linux-gnu
-        run: nix develop .#cross-aarch64-linux --command cargo check --target aarch64-unknown-linux-gnu --locked

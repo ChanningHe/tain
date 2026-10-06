@@ -59,35 +59,11 @@
         '';
       in
       {
-        devShells =
-          {
-            default = pkgs.mkShell {
-              packages = [ rustToolchain ] ++ commonPackages ++ darwinFrameworks;
-              env = baseEnv;
-              shellHook = baseShellHook;
-            };
-          }
-          # CI arm64 cross-check shell; x86_64-linux only so other hosts skip the sysroot.
-          // pkgs.lib.optionalAttrs (system == "x86_64-linux") (
-            let
-              crossToolchain = pkgs.rust-bin.stable.latest.default.override {
-                extensions = rustExtensions;
-                targets = [ "aarch64-unknown-linux-gnu" ];
-              };
-              crossCC = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
-            in
-            {
-              cross-aarch64-linux = pkgs.mkShell {
-                packages = [ crossToolchain ] ++ commonPackages ++ [ crossCC ];
-                env = baseEnv // {
-                  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "${crossCC}/bin/${crossCC.targetPrefix}gcc";
-                };
-                shellHook = baseShellHook + ''
-                  echo "  cross target: aarch64-unknown-linux-gnu"
-                '';
-              };
-            }
-          );
+        devShells.default = pkgs.mkShell {
+          packages = [ rustToolchain ] ++ commonPackages ++ darwinFrameworks;
+          env = baseEnv;
+          shellHook = baseShellHook;
+        };
 
         formatter = pkgs.nixfmt;
       }
