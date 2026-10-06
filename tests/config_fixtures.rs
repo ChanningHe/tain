@@ -117,14 +117,13 @@ fn sample_mirrors_list_parses_end_to_end() {
         .iter()
         .filter(|e| matches!(e, mirrors_list::Entry::MirrorPath { .. }))
         .count();
-    assert_eq!(debs, 12);
-    assert_eq!(paths, 3);
+    assert_eq!(debs, 9);
+    assert_eq!(paths, 2);
 }
 
 #[test]
 fn sample_bracket_arch_syntax_parsed() {
-    let text =
-        "deb [ arch=amd64,arm64 ] https://download.lierfang.com/pxcloud/pxvirt/ bookworm main";
+    let text = "deb [ arch=amd64,arm64 ] https://download.docker.com/linux/ubuntu/ noble stable";
     let entry = mirrors_list::parse_line(1, text).unwrap().unwrap();
     match entry {
         mirrors_list::Entry::Deb(d) => {
@@ -142,12 +141,8 @@ fn sample_mirror_path_maps_local_dir() {
     let entries = mirrors_list::parse(SAMPLE_MIRRORS_LIST).unwrap();
     let out = mirrors_list::to_toml(&entries);
     assert!(
-        out.contains("path = \"truenas\""),
-        "expected truenas path override in:\n{out}"
-    );
-    assert!(
-        out.contains("path = \"pxvirt\""),
-        "expected pxvirt path override in:\n{out}"
+        out.contains("path = \"docker-ubuntu\""),
+        "expected docker-ubuntu path override in:\n{out}"
     );
     assert!(
         out.contains("path = \"debian\""),

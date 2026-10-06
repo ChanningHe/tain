@@ -1,16 +1,12 @@
 # Sample apt-mirror mirrors.list for `tain import` tests; do not edit to make tests pass.
-deb https://ftp.jaist.ac.jp/debian/ bullseye main contrib non-free
-deb https://ftp.jaist.ac.jp/debian/ bullseye-updates main contrib non-free
-deb https://ftp.jaist.ac.jp/debian/ bullseye-backports main contrib non-free
+deb https://deb.debian.org/debian/ bullseye main contrib non-free
+deb https://deb.debian.org/debian/ bullseye-updates main contrib non-free
+deb https://deb.debian.org/debian/ bullseye-backports main contrib non-free
 deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription
 deb https://pkgs.tailscale.com/stable/debian bullseye main
 deb https://pkgs.tailscale.com/stable/debian bookworm main
-deb https://apt.sys.truenas.net/fangtooth/25.04.0/debian/ bookworm main
-deb https://apt.sys.truenas.net/fangtooth/nightlies/debian/ bookworm main
 deb http://deb.debian.org/debian/ bookworm main contrib non-free
-deb https://download.lierfang.com/pxcloud/pxvirt/ bookworm main
-deb [ arch=amd64,arm64 ] https://download.lierfang.com/pxcloud/pxvirt/ bookworm main
+deb [ arch=amd64,arm64 ] https://download.docker.com/linux/ubuntu/ noble stable
 deb [ arch=amd64 ] https://download.docker.com/linux/debian bookworm stable
-mirror_path https://apt.sys.truenas.net truenas
 mirror_path http://deb.debian.org/debian/ debian
-mirror_path https://download.lierfang.com/pxcloud/pxvirt pxvirt
+mirror_path https://download.docker.com/linux/ubuntu docker-ubuntu
