@@ -112,9 +112,13 @@ jobs:
           path: target/x86_64-unknown-linux-musl/debian/*.deb
 
   docker:
-    name: docker image (amd64 + arm64)
+    name: docker image (${{ matrix.variant }})
     runs-on: ubuntu-latest
     needs: [gate, binaries]
+    strategy:
+      matrix:
+        # debug = same image plus busybox, tagged *-debug.
+        variant: [release, debug]
     permissions:
       contents: read
       packages: write
@@ -140,6 +144,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: suffix=${{ matrix.variant == 'debug' && '-debug' || '' }},onlatest=true
           tags: |
             type=semver,pattern={{version}},value=${{ needs.gate.outputs.version }}
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.gate.outputs.version }}
@@ -158,6 +163,7 @@ jobs:
         with:
           context: image
           file: docker/Dockerfile.release
+          build-args: VARIANT=${{ matrix.variant }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
