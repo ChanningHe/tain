@@ -1,7 +1,4 @@
 # Source build: `docker build -f docker/Dockerfile .`
-# The `binary` stage also produces the release tarball binaries.
-# cargo-zigbuild cross-compiles on the build host: zig is the musl C compiler
-# that ring, bzip2-sys and lzma-sys need, so arm64 builds need no emulation.
 
 # ---- build ----
 FROM --platform=$BUILDPLATFORM rust:1.96.1-alpine3.22@sha256:fa16d058a94f0f1cf86cbbbd181a2ea2a0001e1fba1e93c366821a58f3e6c8a1 AS build
