@@ -31,7 +31,8 @@
           "llvm-tools-preview"
         ];
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        rustVersion = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+        rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
           extensions = rustExtensions;
         };
 

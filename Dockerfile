@@ -3,7 +3,7 @@
 # cargo-zigbuild cross-compiles on the build host: zig is the musl C compiler
 # that ring, bzip2-sys and lzma-sys need, so arm64 builds need no emulation.
 
-ARG RUST_VERSION=1.88
+ARG RUST_VERSION=1.96.1
 ARG ALPINE_VERSION=3.22
 
 # ---- build ----

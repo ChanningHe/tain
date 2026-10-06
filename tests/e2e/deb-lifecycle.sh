@@ -7,7 +7,7 @@
 #
 # Environment:
 #   TAIN_E2E_IMAGE       Debian image (default: debian:trixie-slim)
-#   TAIN_E2E_RUST_IMAGE  build image (default: rust:1.88-bookworm)
+#   TAIN_E2E_RUST_IMAGE  build image (default: rust:1.96.1-bookworm)
 #   TAIN_E2E_SKIP_BUILD  1 = require a .deb path as $1
 #   TAIN_E2E_KEEP        1 = keep the container for postmortem
 #
@@ -47,7 +47,7 @@ if [ -n "$DEB_ARG" ]; then
 elif [ "$SKIP_BUILD" = "1" ]; then
     die "TAIN_E2E_SKIP_BUILD=1 but no .deb path passed as \$1"
 else
-    RUST_IMAGE="${TAIN_E2E_RUST_IMAGE:-rust:1.88-bookworm}"
+    RUST_IMAGE="${TAIN_E2E_RUST_IMAGE:-rust:1.96.1-bookworm}"
     log "building .deb inside container ($RUST_IMAGE); output → $DEB_DIR"
     mkdir -p "$DEB_DIR"
 

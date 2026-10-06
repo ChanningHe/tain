@@ -2,7 +2,7 @@
 name = "tain"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
 description = "General-purpose repository mirror sync framework"
 license = "MIT"
 repository = "https://github.com/channinghe/tain"
