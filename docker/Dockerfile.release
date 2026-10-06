@@ -1,0 +1,17 @@
+# Release image: packages binaries already built by the release workflow.
+# Build context layout: amd64/tain, arm64/tain, data/ (empty).
+# distroless static: CA certificates and tzdata, no shell, runs as uid 65532.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+ARG TARGETARCH
+
+COPY ${TARGETARCH}/tain /usr/local/bin/tain
+# Owned by nonroot so a fresh named volume is writable; bind mounts keep host ownership.
+COPY --chown=65532:65532 data /data
+VOLUME ["/data"]
+
+# Override the uid with --user (or Compose `user:`, K8s runAsUser) to match
+# the owner of a bind-mounted data dir.
+ENTRYPOINT ["/usr/local/bin/tain"]
+# daemon needs TAIN_SCHEDULE or global.schedule (else exits 2).
+# Use `sync` instead when an external scheduler drives the runs.
+CMD ["daemon", "--config", "/etc/tain/config.toml"]

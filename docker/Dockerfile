@@ -1,41 +1,37 @@
-# syntax=docker/dockerfile:1.7
-# Static musl build. The `binary` stage feeds the release tarballs.
+# Source build: `docker build -f docker/Dockerfile .`
+# The `binary` stage also produces the release tarball binaries.
 # cargo-zigbuild cross-compiles on the build host: zig is the musl C compiler
 # that ring, bzip2-sys and lzma-sys need, so arm64 builds need no emulation.
 
-ARG RUST_VERSION=1.96.1
-ARG ALPINE_VERSION=3.22
-
 # ---- build ----
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS build
+FROM --platform=$BUILDPLATFORM rust:1.96.1-alpine3.22@sha256:fa16d058a94f0f1cf86cbbbd181a2ea2a0001e1fba1e93c366821a58f3e6c8a1 AS build
 ARG TARGETARCH
 
 # No openssl-dev: TLS is rustls.
-RUN apk add --no-cache \
-    musl-dev \
-    make \
-    perl \
-    pkgconf \
-    zig
+# hadolint ignore=DL3018
+RUN apk add --no-cache musl-dev make perl pkgconf zig
 
 ARG CARGO_ZIGBUILD_VERSION=0.23.4
 RUN cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
 
+WORKDIR /src
+
+# rust-toolchain.toml decides the compiler, whatever the base image ships.
+COPY rust-toolchain.toml ./
 RUN case "$TARGETARCH" in \
     amd64) echo "x86_64-unknown-linux-musl"  > /tmp/rust-target ;; \
     arm64) echo "aarch64-unknown-linux-musl" > /tmp/rust-target ;; \
     *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
-    esac && rustup target add "$(cat /tmp/rust-target)"
-
-WORKDIR /src
+    esac && \
+    rustup toolchain install && \
+    rustup target add "$(cat /tmp/rust-target)"
 
 # Fetch deps from the manifest alone so source edits don't invalidate this layer.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && \
-    RUST_TARGET="$(cat /tmp/rust-target)" && \
-    cargo fetch --locked --target "$RUST_TARGET" && \
+    cargo fetch --locked --target "$(cat /tmp/rust-target)" && \
     rm -rf src
 
 COPY src src
@@ -43,25 +39,17 @@ COPY tests tests
 
 RUN RUST_TARGET="$(cat /tmp/rust-target)" && \
     cargo zigbuild --release --locked --target "$RUST_TARGET" && \
-    cp "target/${RUST_TARGET}/release/tain" /tain
+    cp "target/${RUST_TARGET}/release/tain" /tain && \
+    mkdir /data
 
 # ---- binary only ----
 FROM scratch AS binary
 COPY --from=build /tain /tain
 
-# ---- runtime ----
-FROM alpine:${ALPINE_VERSION} AS runtime
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata
-
+# ---- runtime (same layout as Dockerfile.release) ----
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
 COPY --from=build /tain /usr/local/bin/tain
-
+COPY --from=build --chown=65532:65532 /data /data
 VOLUME ["/data"]
-
-# No PUID/PGID entrypoint: set the uid with --user (or Compose `user:`,
-# K8s runAsUser); the host data dir must be owned by that uid.
 ENTRYPOINT ["/usr/local/bin/tain"]
-# daemon needs TAIN_SCHEDULE or global.schedule (else exits 2).
-# Use `sync` instead when an external scheduler drives the runs.
 CMD ["daemon", "--config", "/etc/tain/config.toml"]

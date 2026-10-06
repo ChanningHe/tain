@@ -1,5 +1,5 @@
 # Single source of truth for the Rust version (local, CI and release builds).
-# Bump deliberately; keep Cargo.toml rust-version and the Dockerfile ARG in sync.
+# Bump deliberately with Cargo.toml rust-version and the docker/Dockerfile rust base image.
 [toolchain]
 channel = "1.96.1"
 profile = "minimal"
