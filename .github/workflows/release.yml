@@ -76,7 +76,7 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           mkdir -p "dist-out/$ASSET"
-          cp bin-out/tain README.md LICENSE-MIT LICENSE-APACHE "dist-out/$ASSET/"
+          cp bin-out/tain README.md LICENSE "dist-out/$ASSET/"
           cp -r dist/systemd "dist-out/$ASSET/"
           cd dist-out
           tar czf "$ASSET.tar.gz" "$ASSET"
