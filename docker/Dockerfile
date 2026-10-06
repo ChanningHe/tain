@@ -11,8 +11,20 @@ ARG TARGETARCH
 # hadolint ignore=DL3018
 RUN apk add --no-cache musl-dev make perl pkgconf zig
 
+# Prebuilt cargo-zigbuild on amd64 build hosts (CI); upstream ships no
+# aarch64-musl build, so arm64 hosts compile it. Bump version and checksum together.
+ARG BUILDARCH
 ARG CARGO_ZIGBUILD_VERSION=0.23.4
-RUN cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
+ADD --checksum=sha256:9e3cf73485edbd45905c8aadbc0fdf869c7ddc3848f0c898229f2680db52e44b \
+    https://github.com/rust-cross/cargo-zigbuild/releases/download/v${CARGO_ZIGBUILD_VERSION}/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz \
+    /tmp/cargo-zigbuild.tar.xz
+RUN if [ "$BUILDARCH" = amd64 ]; then \
+        tar -xJf /tmp/cargo-zigbuild.tar.xz -C /usr/local/cargo/bin --strip-components=1 \
+            cargo-zigbuild-x86_64-unknown-linux-musl/cargo-zigbuild; \
+    else \
+        cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"; \
+    fi && \
+    rm /tmp/cargo-zigbuild.tar.xz
 
 WORKDIR /src
 

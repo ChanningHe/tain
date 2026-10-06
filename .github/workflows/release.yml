@@ -45,10 +45,10 @@ jobs:
         run: nix develop --command cargo test --locked --no-default-features
 
   # docker/Dockerfile's `binary` stage; the image job repackages these binaries.
+  # Runs in parallel with gate; nothing is published unless gate passes.
   binaries:
     name: build ${{ matrix.asset }}
     runs-on: ubuntu-latest
-    needs: gate
     strategy:
       matrix:
         include:
@@ -103,7 +103,9 @@ jobs:
         run: |
           tar xzf bin-in/tain-linux-amd64.tar.gz -C bin-in
           install -D -m 755 bin-in/tain-linux-amd64/tain target/x86_64-unknown-linux-musl/release/tain
-      - run: cargo install --locked cargo-deb --version 3.8.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.8.0
       # With --target, cargo-deb maps `target/release/` assets to the staged path.
       - run: cargo deb --no-build --target x86_64-unknown-linux-musl
       - uses: actions/upload-artifact@v7
