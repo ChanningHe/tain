@@ -46,6 +46,7 @@
           cargo-llvm-cov
           cargo-nextest
           cargo-zigbuild
+          just
           pkg-config
           zig
         ];
