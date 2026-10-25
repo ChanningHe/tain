@@ -1,0 +1,8 @@
+Origin: TainTest
+Suite: bookworm
+Codename: bookworm
+Date: Sat, 03 Feb 2024 09:15:38 UTC
+Architectures: amd64
+Components: main
+SHA256:
+ 29b5df9458622108640b250d9f0d01f22a8ae2fe1d65a3fae8a456e070cde198 179 main/binary-amd64/Packages

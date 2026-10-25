@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bzip2::bufread::BzDecoder;
 use flate2::bufread::GzDecoder;
@@ -97,13 +97,11 @@ pub fn extension_for(compression: Compression) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-fn _touch(_: PathBuf) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

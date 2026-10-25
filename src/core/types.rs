@@ -24,15 +24,20 @@ impl Layer {
 }
 
 /// A validated mirror-relative path; upstream must not be able to steer
-/// writes outside the mirror.
+/// writes outside the mirror or into tain's own files inside it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RelPath(String);
+
+/// Name suffix reserved for tain's sidecars (`.tmp~` downloads,
+/// `.prev.tain~` publish swaps); core must keep its sidecar names ending in it.
+const SIDECAR_SUFFIX: char = '~';
 
 impl RelPath {
     /// # Errors
     ///
-    /// `PathError` if empty, absolute, or containing NUL, backslash, `.`/`..`
-    /// components, or empty segments.
+    /// `PathError` if empty, absolute, or containing NUL, control characters,
+    /// backslash, `.`/`..` components, or empty segments; or if it names the
+    /// private `.tain/` tree or a `~`-suffixed (sidecar) segment.
     pub fn new(s: impl Into<String>) -> Result<Self, PathError> {
         let s = s.into();
         if s.is_empty() {
@@ -44,8 +49,16 @@ impl RelPath {
         if s.contains('\0') {
             return Err(PathError::Nul(s));
         }
+        if s.chars().any(char::is_control) {
+            return Err(PathError::Control(s));
+        }
         if s.contains('\\') {
             return Err(PathError::Backslash(s));
+        }
+        if s.split('/').next() == Some(crate::core::store::STATE_DIR)
+            || s.split('/').any(|seg| seg.ends_with(SIDECAR_SUFFIX))
+        {
+            return Err(PathError::Reserved(s));
         }
         if s.split('/').any(|seg| seg == "..") {
             return Err(PathError::ParentTraversal(s));
@@ -77,22 +90,27 @@ impl std::fmt::Display for RelPath {
     }
 }
 
+/// Paths are untrusted upstream text, so `{0:?}` escapes them for logs.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     #[error("relative path is empty")]
     Empty,
-    #[error("relative path `{0}` starts with `/` (absolute)")]
+    #[error("relative path {0:?} starts with `/` (absolute)")]
     Absolute(String),
-    #[error("relative path `{0}` contains a `..` component")]
+    #[error("relative path {0:?} contains a `..` component")]
     ParentTraversal(String),
-    #[error("relative path `{0}` contains a `.` component")]
+    #[error("relative path {0:?} contains a `.` component")]
     CurrentDir(String),
-    #[error("relative path `{0}` contains an empty segment (`//` or trailing `/`)")]
+    #[error("relative path {0:?} contains an empty segment (`//` or trailing `/`)")]
     EmptySegment(String),
-    #[error("relative path `{0}` contains a NUL byte")]
+    #[error("relative path {0:?} contains a NUL byte")]
     Nul(String),
-    #[error("relative path `{0}` contains a backslash")]
+    #[error("relative path {0:?} contains a control character")]
+    Control(String),
+    #[error("relative path {0:?} contains a backslash")]
     Backslash(String),
+    #[error("relative path {0:?} is reserved for tain (`.tain/` or a `~` sidecar name)")]
+    Reserved(String),
 }
 
 /// Lowercase hex, for error messages only.
@@ -396,6 +414,59 @@ mod tests {
         assert!(RelPath::new(".hidden").is_ok());
         assert!(RelPath::new("..bad").is_ok());
         assert!(RelPath::new("foo/..bar/baz").is_ok());
+    }
+
+    #[test]
+    fn relpath_rejects_tain_private_tree() {
+        for p in [
+            ".tain",
+            ".tain/state.json",
+            ".tain/lock",
+            ".tain/manifest/1.json",
+            ".tain/staging/bookworm/InRelease",
+        ] {
+            assert!(
+                matches!(RelPath::new(p), Err(PathError::Reserved(_))),
+                "{p}"
+            );
+        }
+        // Only the mirror-root `.tain` is private.
+        assert!(RelPath::new("pool/.tain/x.deb").is_ok());
+        assert!(RelPath::new(".tainx/a").is_ok());
+    }
+
+    #[test]
+    fn relpath_rejects_sidecar_suffixes_in_any_segment() {
+        for p in [
+            "pool/main/f/foo/foo.deb.tmp~",
+            "foo.tmp~",
+            "dists/bookworm.prev.tain~",
+            "dists/bookworm.prev.tain~/InRelease",
+            "pool/x~/y.deb",
+        ] {
+            assert!(
+                matches!(RelPath::new(p), Err(PathError::Reserved(_))),
+                "{p}"
+            );
+        }
+        // `~` inside a name (Debian versions) stays legal.
+        assert!(RelPath::new("pool/main/f/foo/foo_1.0~rc1-1_amd64.deb").is_ok());
+    }
+
+    #[test]
+    fn relpath_rejects_control_characters() {
+        for p in ["pool/a\nb.deb", "pool/a\rb", "pool/\x1b[2Jx.deb", "a\x7f"] {
+            assert!(
+                matches!(RelPath::new(p), Err(PathError::Control(_))),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_error_escapes_untrusted_text() {
+        let err = RelPath::new("/a\nINJECTED").unwrap_err().to_string();
+        assert!(!err.contains('\n'), "{err}");
     }
 
     #[test]

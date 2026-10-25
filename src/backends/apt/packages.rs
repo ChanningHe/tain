@@ -131,36 +131,36 @@ fn parse_optional_checksum(
 pub enum PackageParseError {
     #[error("Packages paragraph is missing required field `{field}`")]
     MissingField { field: &'static str },
-    #[error("package `{package}`: Filename `{filename}` is unsafe ({reason})")]
+    #[error("package {package:?}: Filename {filename:?} is unsafe ({reason})")]
     UnsafeFilename {
         package: String,
         filename: String,
         reason: String,
     },
-    #[error("package `{package}`: cannot build pool URL for `{filename}` ({reason})")]
+    #[error("package {package:?}: cannot build pool URL for {filename:?} ({reason})")]
     UrlBuild {
         package: String,
         filename: String,
         reason: String,
     },
-    #[error("package `{package}`: Size `{value}` is not a valid u64")]
+    #[error("package {package:?}: Size {value:?} is not a valid u64")]
     BadSize { package: String, value: String },
-    #[error("package `{package}`: {algo:?} digest `{hex}` is not valid hex")]
+    #[error("package {package:?}: {algo:?} digest {hex:?} is not valid hex")]
     BadHex {
         package: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("package `{package}`: {algo:?} digest length mismatch: expected {expected}, got {got}")]
+    #[error("package {package:?}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         package: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("package `{package}`: no digest fields (SHA512/SHA256/SHA1/MD5sum) present")]
+    #[error("package {package:?}: no digest fields (SHA512/SHA256/SHA1/MD5sum) present")]
     NoDigest { package: String },
-    #[error("package `{package}`: only weak digests (SHA-1 / MD5) — rejected by policy")]
+    #[error("package {package:?}: only weak digests (SHA-1 / MD5) — rejected by policy")]
     WeakDigestOnly { package: String },
 }
 
@@ -234,6 +234,39 @@ SHA256: {}
         );
         assert_eq!(fs.digests.len(), 2);
         assert_eq!(fs.digests.strongest().unwrap().algo, DigestAlgo::Sha512);
+    }
+
+    #[test]
+    fn filename_into_tain_state_or_sidecar_rejected() {
+        let base_url = base();
+        let layout = layout(&base_url);
+        for filename in [".tain/state.json", ".tain/lock", "foo.tmp~"] {
+            let input = format!(
+                "Package: p\nFilename: {filename}\nSize: 10\nSHA256: {}\n",
+                sha256_hex()
+            );
+            let err = paragraph_to_filespec(&read_one(&input), &layout, false).unwrap_err();
+            assert!(
+                matches!(err, PackageParseError::UnsafeFilename { .. }),
+                "{filename}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_filename_rejected_and_error_stays_one_line() {
+        let base_url = base();
+        let layout = layout(&base_url);
+        let input = format!(
+            "Package: p\nFilename: pool/x.deb\n INFO forged log line\nSize: 10\nSHA256: {}\n",
+            sha256_hex()
+        );
+        let err = paragraph_to_filespec(&read_one(&input), &layout, false).unwrap_err();
+        assert!(
+            matches!(err, PackageParseError::UnsafeFilename { .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains('\n'), "{err}");
     }
 
     #[test]

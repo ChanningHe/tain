@@ -203,3 +203,118 @@ fn tempdir() -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+// --- subkey fixtures (tests/fixtures/pgp/subkeys/README.md) ---
+
+fn verify_subkey_fixture(keyring: &str, sig: &str) -> Result<VerifyOutcome, PgpError> {
+    let body = read("subkeys/body.txt");
+    let sig = read(&format!("subkeys/{sig}"));
+    let keyring = fixture(&format!("subkeys/{keyring}"));
+    verify_release_gpg(PgpMode::Required, &body, Some(&sig), Some(&keyring))
+}
+
+#[test]
+fn signing_subkey_with_valid_binding_verifies() {
+    let outcome = verify_subkey_fixture("keyring.asc", "good.sig").unwrap();
+    assert_eq!(outcome, VerifyOutcome::Verified);
+}
+
+#[test]
+fn unrelated_key_signature_is_rejected() {
+    let err = verify_subkey_fixture("keyring.asc", "rogue.sig").unwrap_err();
+    assert!(
+        matches!(err, PgpError::BadSignature { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn subkey_with_forged_binding_signature_is_rejected() {
+    // forged.gpg grafts the rogue key under a certify-only primary with a
+    // binding signature that does not cover it, leaving no usable signer.
+    let err = verify_subkey_fixture("forged.gpg", "rogue.sig").unwrap_err();
+    assert!(
+        matches!(err, PgpError::NoUsableKey { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn revoked_subkey_is_rejected() {
+    let err = verify_subkey_fixture("revoked.asc", "good.sig").unwrap_err();
+    assert!(
+        matches!(err, PgpError::NoUsableKey { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn revoked_primary_is_rejected() {
+    let err = verify_subkey_fixture("revoked-primary.asc", "revoked-primary.sig").unwrap_err();
+    assert!(
+        matches!(err, PgpError::NoUsableKey { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn signature_older_than_key_is_rejected() {
+    let err = verify_subkey_fixture("late.asc", "early.sig").unwrap_err();
+    assert!(
+        matches!(err, PgpError::NoUsableKey { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn detached_signature_verifies_via_its_second_packet() {
+    // Two signature packets; the keyring holds only the second signer.
+    for sig in ["dual.sig", "dual.sig.bin"] {
+        let outcome = verify_subkey_fixture("dual-second.asc", sig).unwrap();
+        assert_eq!(outcome, VerifyOutcome::Verified, "{sig}");
+    }
+}
+
+#[test]
+fn multi_packet_detached_signature_from_unknown_keys_is_rejected() {
+    for sig in ["dual.sig", "dual.sig.bin"] {
+        let err = verify_subkey_fixture("keyring.asc", sig).unwrap_err();
+        assert!(
+            matches!(err, PgpError::BadSignature { .. }),
+            "{sig}: unexpected error: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn key_in_second_armor_block_of_keyring_verifies() {
+    // concat.asc = `cat keyring.asc rogue-key.asc`.
+    let outcome = verify_subkey_fixture("concat.asc", "rogue.sig").unwrap();
+    assert_eq!(outcome, VerifyOutcome::Verified);
+}
+
+#[test]
+fn signature_in_second_armor_block_verifies() {
+    // concat.sig = `cat rogue.sig good.sig`; only good.sig's signer is trusted.
+    let outcome = verify_subkey_fixture("keyring.asc", "concat.sig").unwrap();
+    assert_eq!(outcome, VerifyOutcome::Verified);
+}
+
+#[test]
+fn legacy_keyring_with_trust_packets_verifies() {
+    // Same keys as keyring.asc, stored the way ubuntu-archive-keyring.gpg is.
+    let outcome = verify_subkey_fixture("trust.gpg", "good.sig").unwrap();
+    assert_eq!(outcome, VerifyOutcome::Verified);
+}
+
+#[test]
+fn weak_digest_signatures_are_rejected() {
+    for sig in ["md5.sig", "sha1.sig", "ripemd160.sig"] {
+        let err = verify_subkey_fixture("keyring.asc", sig)
+            .expect_err("weak-digest signature must not verify");
+        assert!(
+            matches!(err, PgpError::WeakDigest { .. }),
+            "{sig}: unexpected error: {err:?}"
+        );
+    }
+}

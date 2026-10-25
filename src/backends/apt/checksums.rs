@@ -153,26 +153,26 @@ pub struct WeakHashReport {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChecksumError {
-    #[error("hex digest for `{path}` ({algo:?}) is not valid: `{hex}`")]
+    #[error("hex digest for {path:?} ({algo:?}) is not valid: {hex:?}")]
     BadHex {
         path: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("hex digest for `{path}` ({algo:?}) length mismatch: expected {expected}, got {got}")]
+    #[error("hex digest for {path:?} ({algo:?}) length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         path: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("checksum size mismatch for `{path}`: was {previous}, now {current}")]
+    #[error("checksum size mismatch for {path:?}: was {previous}, now {current}")]
     SizeConflict {
         path: String,
         previous: u64,
         current: u64,
     },
-    #[error("conflicting {algo:?} digest for `{path}`: existing {existing} vs incoming {incoming}")]
+    #[error("conflicting {algo:?} digest for {path:?}: existing {existing} vs incoming {incoming}")]
     ConflictingDigest {
         path: String,
         algo: DigestAlgo,

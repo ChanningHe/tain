@@ -237,48 +237,48 @@ pub enum SourceParseError {
     MissingField { field: &'static str },
     #[error("Sources paragraph advertises no checksum block (Checksums-Sha256 is mandatory)")]
     MissingChecksums { package: String },
-    #[error("package `{package}`: file `{filename}`: no digest recorded")]
+    #[error("package {package:?}: file {filename:?}: no digest recorded")]
     NoDigest { package: String, filename: String },
-    #[error("package `{package}`: file `{filename}`: only weak digests (rejected by policy)")]
+    #[error("package {package:?}: file {filename:?}: only weak digests (rejected by policy)")]
     WeakDigestOnly { package: String, filename: String },
-    #[error("package `{package}`: malformed checksum line `{snippet}`")]
+    #[error("package {package:?}: malformed checksum line {snippet:?}")]
     MalformedLine { package: String, snippet: String },
-    #[error("package `{package}`: Size `{value}` is not a valid u64")]
+    #[error("package {package:?}: Size {value:?} is not a valid u64")]
     BadSize { package: String, value: String },
-    #[error("package `{package}`: {algo:?} digest `{hex}` is not valid hex")]
+    #[error("package {package:?}: {algo:?} digest {hex:?} is not valid hex")]
     BadHex {
         package: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("package `{package}`: {algo:?} digest length mismatch: expected {expected}, got {got}")]
+    #[error("package {package:?}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         package: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("package `{package}`: file `{filename}` size conflicts: {previous} vs {current}")]
+    #[error("package {package:?}: file {filename:?} size conflicts: {previous} vs {current}")]
     SizeConflict {
         package: String,
         filename: String,
         previous: u64,
         current: u64,
     },
-    #[error("package `{package}`: path `{path}` is unsafe ({reason})")]
+    #[error("package {package:?}: path {path:?} is unsafe ({reason})")]
     UnsafeFilename {
         package: String,
         path: String,
         reason: String,
     },
-    #[error("package `{package}`: cannot build URL for `{path}` ({reason})")]
+    #[error("package {package:?}: cannot build URL for {path:?} ({reason})")]
     UrlBuild {
         package: String,
         path: String,
         reason: String,
     },
     #[error(
-        "package `{package}`: file `{filename}`: conflicting {algo:?} digest existing {existing} vs incoming {incoming}"
+        "package {package:?}: file {filename:?}: conflicting {algo:?} digest existing {existing} vs incoming {incoming}"
     )]
     ConflictingDigest {
         package: String,

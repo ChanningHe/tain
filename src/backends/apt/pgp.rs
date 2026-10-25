@@ -106,6 +106,11 @@ pub enum PgpError {
     BadSignature { artifact: &'static str },
     #[error("keyring holds no key that could have signed {artifact}")]
     NoUsableKey { artifact: &'static str },
+    #[error("PGP signature for {artifact} uses the weak digest {digest}, which apt rejects")]
+    WeakDigest {
+        artifact: &'static str,
+        digest: String,
+    },
     #[error(
         "PGP verification for {artifact} was requested but the tain binary was built without the `pgp` cargo feature"
     )]
@@ -114,18 +119,29 @@ pub enum PgpError {
 
 #[cfg(feature = "pgp")]
 mod imp {
+    //! Key usability follows gpgv as driven by apt: only self-signatures that
+    //! verify count, revoked keys are dead, signing subkeys need a verified
+    //! binding with the sign flag plus a back-signature, and both the signer and
+    //! its primary must be valid at signature time and now.
+
     use super::{PgpError, VerifyOutcome};
+    use pgp::armor::Dearmor;
     use pgp::composed::{
         CleartextSignedMessage, Deserializable, DetachedSignature, SignedPublicKey,
+        SignedPublicSubKey,
     };
-    use pgp::types::KeyDetails as _;
-    use std::io::BufReader;
+    use pgp::crypto::hash::HashAlgorithm;
+    use pgp::packet::{
+        Packet, PacketParser, PublicKey, PublicSubkey, Signature, SignatureType, SubpacketData,
+    };
+    use pgp::types::{KeyDetails as _, Tag};
+    use std::io::Read as _;
     use std::path::Path;
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
-    fn to_std_duration(d: pgp::types::Duration) -> Duration {
-        Duration::from(d)
-    }
+    /// Signatures examined per document; real archives use one to three, and
+    /// each extra one costs a trial verification per keyring key.
+    const MAX_SIGNATURES: usize = 32;
 
     pub(super) fn verify_clearsigned(
         armored_input: &[u8],
@@ -133,38 +149,14 @@ mod imp {
         artifact: &'static str,
     ) -> Result<VerifyOutcome, PgpError> {
         let keys = load_keyring(keyring_path)?;
-
         let (msg, _headers) = CleartextSignedMessage::from_armor(armored_input).map_err(|e| {
             PgpError::SignatureParse {
                 artifact,
                 source: Box::new(SnafuWrap(e.to_string())),
             }
         })?;
-
-        let now = SystemTime::now();
-        let mut ever_attempted = false;
-        for cert in &keys {
-            if !key_expired(cert, now) {
-                ever_attempted = true;
-                if msg.verify(&cert.primary_key).is_ok() {
-                    return Ok(VerifyOutcome::Verified);
-                }
-            }
-            for sub in &cert.public_subkeys {
-                if subkey_expired(sub, now) {
-                    continue;
-                }
-                ever_attempted = true;
-                if msg.verify(&sub.key).is_ok() {
-                    return Ok(VerifyOutcome::Verified);
-                }
-            }
-        }
-        if ever_attempted {
-            Err(PgpError::BadSignature { artifact })
-        } else {
-            Err(PgpError::NoUsableKey { artifact })
-        }
+        let text = msg.signed_text();
+        verify_any(&keys, msg.signatures(), text.as_bytes(), artifact)
     }
 
     pub(super) fn verify_detached(
@@ -174,30 +166,47 @@ mod imp {
         artifact: &'static str,
     ) -> Result<VerifyOutcome, PgpError> {
         let keys = load_keyring(keyring_path)?;
-
-        let sig = parse_detached(signature_bytes).map_err(|e| PgpError::SignatureParse {
+        let sigs = parse_detached(signature_bytes).map_err(|e| PgpError::SignatureParse {
             artifact,
             source: Box::new(SnafuWrap(e)),
         })?;
+        verify_any(&keys, &sigs, body, artifact)
+    }
 
+    fn verify_any(
+        keys: &[SignedPublicKey],
+        sigs: &[Signature],
+        data: &[u8],
+        artifact: &'static str,
+    ) -> Result<VerifyOutcome, PgpError> {
+        let sigs = &sigs[..sigs.len().min(MAX_SIGNATURES)];
+        let candidates: Vec<Candidate<'_>> = keys.iter().flat_map(candidates).collect();
         let now = SystemTime::now();
+        let mut weak = Vec::new();
         let mut ever_attempted = false;
-        for cert in &keys {
-            if !key_expired(cert, now) {
+        for sig in sigs {
+            if let Some(alg) = sig.hash_alg().filter(is_weak_digest) {
+                weak.push(alg);
+                continue;
+            }
+            let Some(sig_time) = sig.created().map(SystemTime::from) else {
+                continue;
+            };
+            for c in candidates
+                .iter()
+                .filter(|c| c.valid_at(sig_time) && c.valid_at(now))
+            {
                 ever_attempted = true;
-                if sig.verify(&cert.primary_key, body).is_ok() {
+                if c.verifies(sig, data) {
                     return Ok(VerifyOutcome::Verified);
                 }
             }
-            for sub in &cert.public_subkeys {
-                if subkey_expired(sub, now) {
-                    continue;
-                }
-                ever_attempted = true;
-                if sig.verify(&sub.key, body).is_ok() {
-                    return Ok(VerifyOutcome::Verified);
-                }
-            }
+        }
+        if let Some(alg) = weak.first().filter(|_| weak.len() == sigs.len()) {
+            return Err(PgpError::WeakDigest {
+                artifact,
+                digest: alg.to_string(),
+            });
         }
         if ever_attempted {
             Err(PgpError::BadSignature { artifact })
@@ -206,69 +215,242 @@ mod imp {
         }
     }
 
+    /// gpgv as invoked by apt treats these as invalid.
+    fn is_weak_digest(alg: &HashAlgorithm) -> bool {
+        matches!(
+            alg,
+            HashAlgorithm::Md5 | HashAlgorithm::Sha1 | HashAlgorithm::Ripemd160
+        )
+    }
+
+    enum KeyRef<'a> {
+        Primary(&'a PublicKey),
+        Sub(&'a PublicSubkey),
+    }
+
+    /// A key allowed to sign data, valid in `[created, expires)`.
+    struct Candidate<'a> {
+        key: KeyRef<'a>,
+        created: SystemTime,
+        expires: Option<SystemTime>,
+    }
+
+    impl Candidate<'_> {
+        fn valid_at(&self, t: SystemTime) -> bool {
+            self.created <= t && self.expires.is_none_or(|e| t < e)
+        }
+
+        fn verifies(&self, sig: &Signature, data: &[u8]) -> bool {
+            match self.key {
+                KeyRef::Primary(k) => sig.verify(k, data).is_ok(),
+                KeyRef::Sub(k) => sig.verify(k, data).is_ok(),
+            }
+        }
+    }
+
+    /// Signing-capable keys of one certificate; empty if the primary is
+    /// revoked or has no verifiable self-signature.
+    fn candidates(cert: &SignedPublicKey) -> Vec<Candidate<'_>> {
+        let pk = &cert.primary_key;
+        if cert
+            .details
+            .revocation_signatures
+            .iter()
+            .any(|s| s.verify_key(pk).is_ok())
+        {
+            return Vec::new();
+        }
+        let Some(self_sig) = newest_self_signature(cert) else {
+            return Vec::new();
+        };
+        let created = SystemTime::from(pk.created_at());
+        let expires = expiry(created, self_sig);
+        let mut out = Vec::new();
+        // Legacy keys without a key-flags subpacket may sign with the primary.
+        if !has_key_flags(self_sig) || self_sig.key_flags().sign() {
+            out.push(Candidate {
+                key: KeyRef::Primary(pk),
+                created,
+                expires,
+            });
+        }
+        out.extend(
+            cert.public_subkeys
+                .iter()
+                .filter_map(|sub| subkey_candidate(pk, sub, created, expires)),
+        );
+        out
+    }
+
+    /// Newest direct-key or user-ID self-signature that actually verifies.
+    fn newest_self_signature(cert: &SignedPublicKey) -> Option<&Signature> {
+        let pk = &cert.primary_key;
+        let direct = cert
+            .details
+            .direct_signatures
+            .iter()
+            .filter(|s| s.verify_key(pk).is_ok());
+        let user = cert.details.users.iter().flat_map(|u| {
+            u.signatures.iter().filter(move |s| {
+                s.typ() != Some(SignatureType::CertRevocation)
+                    && s.verify_certification(pk, Tag::UserId, &u.id).is_ok()
+            })
+        });
+        direct.chain(user).max_by_key(|s| s.created())
+    }
+
+    fn subkey_candidate<'a>(
+        pk: &PublicKey,
+        sub: &'a SignedPublicSubKey,
+        primary_created: SystemTime,
+        primary_expires: Option<SystemTime>,
+    ) -> Option<Candidate<'a>> {
+        let bound = |s: &&Signature| s.verify_subkey_binding(pk, &sub.key).is_ok();
+        let of_type = |t| move |s: &&Signature| s.typ() == Some(t);
+        if sub
+            .signatures
+            .iter()
+            .filter(of_type(SignatureType::SubkeyRevocation))
+            .any(|s| bound(&s))
+        {
+            return None;
+        }
+        let binding = sub
+            .signatures
+            .iter()
+            .filter(of_type(SignatureType::SubkeyBinding))
+            .filter(bound)
+            .max_by_key(|s| s.created())?;
+        if !binding.key_flags().sign() {
+            return None;
+        }
+        // Without the back-signature anyone could bind someone else's signing key.
+        binding
+            .embedded_signature()?
+            .verify_primary_key_binding(&sub.key, pk)
+            .ok()?;
+        let created = SystemTime::from(sub.key.created_at());
+        let expires = match (expiry(created, binding), primary_expires) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Some(Candidate {
+            key: KeyRef::Sub(&sub.key),
+            created: created.max(primary_created),
+            expires,
+        })
+    }
+
+    fn expiry(created: SystemTime, sig: &Signature) -> Option<SystemTime> {
+        sig.key_expiration_time()
+            .map(std::time::Duration::from)
+            .filter(|d| !d.is_zero())
+            .map(|d| created + d)
+    }
+
+    fn has_key_flags(sig: &Signature) -> bool {
+        sig.config().is_some_and(|c| {
+            c.hashed_subpackets()
+                .any(|p| matches!(p.data, SubpacketData::KeyFlags(_)))
+        })
+    }
+
     fn load_keyring(path: &Path) -> Result<Vec<SignedPublicKey>, PgpError> {
-        let file = std::fs::File::open(path).map_err(|e| PgpError::KeyringLoad {
+        let load_err = |msg: String| PgpError::KeyringLoad {
+            path: path.to_path_buf(),
+            source: Box::new(SnafuWrap(msg)),
+        };
+        let raw = std::fs::read(path).map_err(|e| PgpError::KeyringLoad {
             path: path.to_path_buf(),
             source: Box::new(e),
         })?;
-        // Auto-detects armored vs binary; multi-key bundles are supported.
-        let reader = BufReader::new(file);
-        let (iter, _headers) =
-            SignedPublicKey::from_reader_many_buf(reader).map_err(|e| PgpError::KeyringLoad {
-                path: path.to_path_buf(),
-                source: Box::new(SnafuWrap(e.to_string())),
-            })?;
-        let keys: Vec<SignedPublicKey> =
-            iter.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| PgpError::KeyringLoad {
-                    path: path.to_path_buf(),
-                    source: Box::new(SnafuWrap(e.to_string())),
-                })?;
+        let binary = dearmor_all(&raw).map_err(load_err)?;
+        let packets = PacketParser::new(&binary[..])
+            .filter_map(keyring_packet)
+            .peekable();
+        let keys = SignedPublicKey::from_packets(packets)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| load_err(e.to_string()))?;
         if keys.is_empty() {
-            return Err(PgpError::KeyringLoad {
-                path: path.to_path_buf(),
-                source: Box::new(SnafuWrap("keyring contains no OpenPGP public keys".into())),
-            });
+            return Err(load_err("keyring contains no OpenPGP public keys".into()));
         }
         Ok(keys)
     }
 
-    fn parse_detached(bytes: &[u8]) -> Result<DetachedSignature, String> {
-        // Armored first, then binary packets.
-        if let Ok((sig, _)) = DetachedSignature::from_armor_single(bytes) {
-            return Ok(sig);
+    /// Binary OpenPGP packets from binary or armored input. Armored input may
+    /// hold several blocks (`cat a.asc b.asc > keyring.asc`); all are decoded
+    /// and concatenated, and text between them is ignored.
+    fn dearmor_all(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        const BEGIN: &[u8] = b"-----BEGIN PGP ";
+        const END: &[u8] = b"-----END PGP ";
+        if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+            return Ok(bytes.to_vec());
         }
-        DetachedSignature::from_bytes(bytes).map_err(|e| e.to_string())
-    }
-
-    fn key_expired(cert: &SignedPublicKey, now: SystemTime) -> bool {
-        let created = SystemTime::from(cert.primary_key.created_at());
-        // Expiration lives on a direct-key signature or a user self-certification.
-        let expiration = cert
-            .details
-            .direct_signatures
-            .iter()
-            .find_map(|s| s.key_expiration_time())
-            .or_else(|| {
-                cert.details
-                    .users
+        let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(start) = find(rest, BEGIN) {
+            let block = &rest[start..];
+            // Through the end of the `-----END PGP ...-----` line.
+            let end = find(block, END).map_or(block.len(), |e| {
+                block[e..]
                     .iter()
-                    .flat_map(|u| u.signatures.iter())
-                    .find_map(|s| s.key_expiration_time())
+                    .position(|&b| b == b'\n')
+                    .map_or(block.len(), |nl| e + nl + 1)
             });
-        match expiration {
-            Some(dur) if dur.as_secs() > 0 => now > created + to_std_duration(dur),
-            _ => false,
+            Dearmor::new(&block[..end])
+                .read_to_end(&mut out)
+                .map_err(|e| format!("bad armor block: {e}"))?;
+            rest = &block[end..];
         }
+        if out.is_empty() {
+            return Err("no OpenPGP data (neither binary nor an armor block)".into());
+        }
+        Ok(out)
     }
 
-    fn subkey_expired(sub: &pgp::composed::SignedPublicSubKey, now: SystemTime) -> bool {
-        let created = SystemTime::from(sub.key.created_at());
-        let expiration = sub.signatures.iter().find_map(|s| s.key_expiration_time());
-        match expiration {
-            Some(dur) if dur.as_secs() > 0 => now > created + to_std_duration(dur),
-            _ => false,
+    /// rpgp's own skip rules for binary input (its `filter_parsed_packet_results`
+    /// is private), plus GnuPG trust packets: legacy keyrings such as
+    /// ubuntu-archive-keyring.gpg interleave them, and rpgp's key parser stops
+    /// at the first one, dropping the user IDs, signatures and subkeys after it.
+    fn keyring_packet(p: pgp::errors::Result<Packet>) -> Option<pgp::errors::Result<Packet>> {
+        use pgp::errors::Error;
+        let skip = match &p {
+            Ok(packet) => matches!(
+                packet,
+                Packet::Trust(_) | Packet::Marker(_) | Packet::Padding(_)
+            ),
+            Err(Error::Unsupported { .. } | Error::PacketIncomplete { .. }) => true,
+            Err(Error::InvalidPacketContent { source }) => matches!(
+                **source,
+                Error::Unsupported { .. } | Error::EllipticCurve { .. }
+            ),
+            Err(_) => false,
+        };
+        (!skip).then_some(p)
+    }
+
+    /// Every signature packet in a detached signature (binary, or armored in
+    /// one or more blocks). Multi-signed `Release.gpg` files (e.g.
+    /// security.debian.org) carry one packet per archive key, and any one of
+    /// them may be the trusted one. Unparseable packets are skipped as long as
+    /// at least one parses.
+    fn parse_detached(bytes: &[u8]) -> Result<Vec<Signature>, String> {
+        let binary = dearmor_all(bytes)?;
+        let iter = DetachedSignature::from_bytes_many(&binary[..]).map_err(|e| e.to_string())?;
+        let mut first_err = None;
+        let sigs: Vec<Signature> = iter
+            .filter_map(|r| {
+                r.map_err(|e| first_err.get_or_insert(e.to_string()).clone())
+                    .ok()
+            })
+            .map(|d| d.signature)
+            .take(MAX_SIGNATURES)
+            .collect();
+        if sigs.is_empty() {
+            return Err(first_err.unwrap_or_else(|| "no signature packets".to_owned()));
         }
+        Ok(sigs)
     }
 
     #[derive(Debug)]

@@ -46,7 +46,7 @@ impl Backend for AptBackend {
         for suite in &apt.suites {
             if suite == "./" || suite == "." {
                 return Err(BackendError::Config(format!(
-                    "mirror `{}`: flat-repo suite `{}` targets the mirror root and can't be \
+                    "mirror `{}`: flat-repo suite {:?} targets the mirror root and can't be \
                      published atomically — use `<dir>/./` instead",
                     mirror.name, suite,
                 )));
@@ -93,10 +93,9 @@ impl Backend for AptBackend {
             if is_layout_flat_form(suite) {
                 continue;
             }
-            let layout = crate::backends::apt::layout::SuiteLayout::new(&mirror.url, suite);
-            if let Err(e) = layout.suite_rel("InRelease") {
+            if let Some(e) = unsafe_suite_reason(&mirror.url, suite) {
                 return Err(BackendError::Config(format!(
-                    "mirror `{}`: suite `{}` produces an unsafe path: {}",
+                    "mirror `{}`: suite {:?} produces an unsafe path: {:?}",
                     mirror.name, suite, e,
                 )));
             }
@@ -108,6 +107,16 @@ impl Backend for AptBackend {
     fn strategy(&self) -> SyncStrategy<'_> {
         SyncStrategy::Manifest(self)
     }
+}
+
+/// Why a dists-style `suite` would place files outside the mirror root, if
+/// it would. Shared with `tain import` so it never emits what `check` rejects.
+#[must_use]
+pub fn unsafe_suite_reason(url: &url::Url, suite: &str) -> Option<String> {
+    layout::SuiteLayout::new(url, suite)
+        .suite_rel("InRelease")
+        .err()
+        .map(|e| e.to_string())
 }
 
 /// Flat forms `SuiteLayout::is_flat` handles: `./` or a suite ending in `/./`.

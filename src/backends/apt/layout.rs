@@ -65,7 +65,8 @@ impl<'a> SuiteLayout<'a> {
     }
 
     /// Local relative path for a root-scope file (`pool/main/n/nginx/*.deb`,
-    /// or, in a flat repo, `xyz.deb`). Applies `Filename` path safety.
+    /// or, in a flat repo, `xyz.deb`). Applies `Filename` path safety,
+    /// including `RelPath`'s refusal of `.tain/` and `~` sidecar names.
     pub fn root_rel(&self, name: &str) -> Result<RelPath, PathError> {
         RelPath::new(name.to_owned())
     }
@@ -125,17 +126,37 @@ fn compute_by_hash_rel(entry_path: &str, algo_dir: &str, hex: &str) -> String {
     }
 }
 
-/// Join onto `base` as a directory, so `Url::join` keeps its last segment.
+/// Append `suffix` (an already validated relative path) under `base` as
+/// literal path segments. Never parsed as a URL reference, so `http:host/x`,
+/// `?`, `#` and `%` cannot leave the base origin or alter the request path.
+/// Errors name only the base path: the base may carry `user:password@`.
 fn join_url(base: &Url, suffix: &str) -> Result<Url, LayoutError> {
-    let base_str = base.as_str();
-    let base_dir = if base_str.ends_with('/') {
-        base.clone()
-    } else {
-        Url::parse(&format!("{base_str}/")).map_err(|e| LayoutError::UrlJoin(e.to_string()))?
+    let mut url = base.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let base_dir = base.path().trim_end_matches('/').to_owned();
+    url.path_segments_mut()
+        .map_err(|()| {
+            LayoutError::UrlJoin(format!("{} base URL cannot hold a path", base.scheme()))
+        })?
+        .pop_if_empty()
+        .extend(suffix.split('/'));
+    // Defense in depth: scheme and authority are untouched by construction, so
+    // only the path prefix can go wrong.
+    let Some(appended) = url
+        .path()
+        .strip_prefix(&base_dir)
+        .filter(|rest| rest.starts_with('/'))
+    else {
+        return Err(LayoutError::UrlJoin(format!(
+            "{suffix:?} escapes base path {base_dir:?}"
+        )));
     };
-    base_dir
-        .join(suffix)
-        .map_err(|e| LayoutError::UrlJoin(e.to_string()))
+    // `extend` leaves `+` and `~` literal; apt quotes both (`QuoteString(.., "+~ ")`),
+    // and S3 reads a raw `+` as a space. Neither can come from the encoder itself.
+    let appended = appended.replace('+', "%2B").replace('~', "%7E");
+    url.set_path(&format!("{base_dir}{appended}"));
+    Ok(url)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +360,93 @@ mod tests {
         let base = base("https://example.com/repo/");
         let l = SuiteLayout::new(&base, "bookworm");
         assert!(l.suite_url("../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn root_rel_rejects_tain_state_and_sidecars() {
+        let base = base("https://deb.debian.org/debian");
+        let l = SuiteLayout::new(&base, "bookworm");
+        for name in [".tain/state.json", ".tain/lock", "foo.tmp~"] {
+            assert!(l.root_rel(name).is_err(), "{name}");
+            assert!(l.root_url(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn flat_suite_rel_rejects_tain_state() {
+        // A flat Release's checksum paths land directly under the mirror root.
+        let base = base("https://example.com/repo/");
+        let l = SuiteLayout::new(&base, "./");
+        assert!(l.suite_rel(".tain/state.json").is_err());
+    }
+
+    #[test]
+    fn scheme_relative_filename_stays_on_base_origin() {
+        for base_str in [
+            "https://deb.debian.org/debian",
+            "http://deb.debian.org/debian/",
+        ] {
+            let base = base(base_str);
+            let l = SuiteLayout::new(&base, "bookworm");
+            for name in [
+                "https:127.0.0.1:18799/x.deb",
+                "http:169.254.169.254/latest/meta-data",
+                "ftp:evil.example/x.deb",
+                "javascript:alert(1)",
+            ] {
+                let url = l.root_url(name).unwrap();
+                assert_eq!(url.host_str(), Some("deb.debian.org"), "{name} -> {url}");
+                assert_eq!(url.scheme(), base.scheme(), "{name} -> {url}");
+                assert!(url.path().starts_with("/debian/"), "{name} -> {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn url_metacharacters_in_filename_are_percent_encoded() {
+        let base = base("https://example.com/repo");
+        let l = SuiteLayout::new(&base, "bookworm");
+        // Must stay one path, not a query/fragment or a decoded `%3a`.
+        assert_eq!(
+            l.root_url("pool/a?b#c.deb").unwrap().as_str(),
+            "https://example.com/repo/pool/a%3Fb%23c.deb"
+        );
+        assert_eq!(
+            l.root_url("pool/x/x_1%3a2.0_all.deb").unwrap().as_str(),
+            "https://example.com/repo/pool/x/x_1%253a2.0_all.deb"
+        );
+    }
+
+    #[test]
+    fn plus_and_tilde_are_quoted_like_apt() {
+        // apt quotes `+~ ` (S3 decodes a raw `+` as a space, LP#1003633);
+        // the configured base path is left as written.
+        let base = base("https://example.com/~me/debian");
+        let l = SuiteLayout::new(&base, "bookworm");
+        assert_eq!(
+            l.root_url("pool/main/g/g++-12/g++-12_12.3.0-1~deb12u1_amd64.deb")
+                .unwrap()
+                .as_str(),
+            "https://example.com/~me/debian/pool/main/g/g%2B%2B-12/g%2B%2B-12_12.3.0-1%7Edeb12u1_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn url_errors_do_not_echo_the_base_url() {
+        let base = base("mailto:user:s3cret@example.com");
+        let l = SuiteLayout::new(&base, "bookworm");
+        let err = l.root_url("pool/x.deb").unwrap_err().to_string();
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn base_query_and_fragment_are_dropped() {
+        let base = base("https://example.com/repo/?token=1#frag");
+        let l = SuiteLayout::new(&base, "bookworm");
+        assert_eq!(
+            l.suite_url("InRelease").unwrap().as_str(),
+            "https://example.com/repo/dists/bookworm/InRelease"
+        );
     }
 
     #[test]

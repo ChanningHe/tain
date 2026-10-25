@@ -58,7 +58,7 @@ pub fn parse_installer_sums(
         if hex_clean.len() != 64 || !hex_clean.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(InstallerSumsError::MalformedLine {
                 line: line_no,
-                reason: format!("expected 64 lowercase hex chars, got `{hex_clean}`"),
+                reason: format!("expected 64 hex chars, got {hex_clean:?}"),
             });
         }
         let bytes = decode_hex(hex_clean).ok_or_else(|| InstallerSumsError::MalformedLine {
@@ -140,13 +140,13 @@ fn ascii_hex_value(b: u8) -> Option<u8> {
 pub enum InstallerSumsError {
     #[error("SHA256SUMS line {line}: {reason}")]
     MalformedLine { line: u32, reason: String },
-    #[error("SHA256SUMS line {line}: refusing unsafe path `{path}`: {reason}")]
+    #[error("SHA256SUMS line {line}: refusing unsafe path {path:?}: {reason}")]
     UnsafePath {
         line: u32,
         path: String,
         reason: String,
     },
-    #[error("SHA256SUMS line {line}: failed to build URL for `{path}`: {reason}")]
+    #[error("SHA256SUMS line {line}: failed to build URL for {path:?}: {reason}")]
     UrlBuild {
         line: u32,
         path: String,

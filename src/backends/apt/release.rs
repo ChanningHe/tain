@@ -33,11 +33,11 @@ pub enum ReleaseParseError {
     Empty,
     #[error("Release contains more than one paragraph")]
     ExtraParagraph,
-    #[error("checksum line for `{path}` is malformed: `{snippet}`")]
+    #[error("checksum line for {path:?} is malformed: {snippet:?}")]
     BadChecksumLine { path: String, snippet: String },
-    #[error("checksum size for `{path}` is not an integer: `{value}`")]
+    #[error("checksum size for {path:?} is not an integer: {value:?}")]
     BadChecksumSize { path: String, value: String },
-    #[error("checksum path for `{path}` fails safety check: {reason}")]
+    #[error("checksum path for {path:?} fails safety check: {reason}")]
     UnsafePath { path: String, reason: String },
     #[error(transparent)]
     Checksum(#[from] ChecksumError),

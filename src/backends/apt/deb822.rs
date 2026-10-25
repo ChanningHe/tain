@@ -173,12 +173,6 @@ impl<R: BufRead> Deb822Reader<R> {
                 }
                 break;
             }
-            if self.line_buf.len() >= MAX_LINE_BYTES {
-                return Err(ParseError::LineTooLong {
-                    line: self.line_no + 1,
-                    limit: MAX_LINE_BYTES,
-                });
-            }
             let ch = match byte[0] {
                 b'\n' => break,
                 b'\r' => continue,
@@ -188,6 +182,12 @@ impl<R: BufRead> Deb822Reader<R> {
                     self.decode_multibyte(byte[0])?
                 }
             };
+            if self.line_buf.len() + ch.len_utf8() > MAX_LINE_BYTES {
+                return Err(ParseError::LineTooLong {
+                    line: self.line_no + 1,
+                    limit: MAX_LINE_BYTES,
+                });
+            }
             self.line_buf.push(ch);
         }
         self.line_no += 1;
@@ -284,9 +284,9 @@ fn validate_field_name(name: &str) -> Result<(), FieldNameProblem> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("line {line}: field header has no `:`: `{snippet}`")]
+    #[error("line {line}: field header has no `:`: {snippet:?}")]
     MissingColon { line: usize, snippet: String },
-    #[error("line {line}: field name `{name}` is invalid ({reason})")]
+    #[error("line {line}: field name {name:?} is invalid ({reason})")]
     MalformedFieldName {
         line: usize,
         name: String,
@@ -556,18 +556,30 @@ SHA256:
         assert_eq!(vals, vec!["a", "b"]);
     }
 
+    /// A `Field: aaa…` line of exactly `len` bytes, excluding the terminator.
+    fn line_of(len: usize, terminator: &str) -> String {
+        format!("Field: {}{terminator}", "a".repeat(len - "Field: ".len()))
+    }
+
     #[test]
-    fn line_exceeding_ceiling_rejected() {
-        let payload_len = 2 * 1024 * 1024;
-        if MAX_LINE_BYTES <= payload_len {
-            let s = format!("Field: {}", "a".repeat(payload_len));
-            let err = Deb822Reader::new(Cursor::new(s))
+    fn line_exactly_at_ceiling_accepted() {
+        for terminator in ["\n", "\r\n", ""] {
+            let p = Deb822Reader::new(Cursor::new(line_of(MAX_LINE_BYTES, terminator)))
                 .read_paragraph()
-                .unwrap_err();
-            assert!(matches!(err, ParseError::LineTooLong { .. }), "{err:?}");
-        } else {
-            let s = format!("Field: {}", "a".repeat(MAX_LINE_BYTES));
-            let err = Deb822Reader::new(Cursor::new(s))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                p.get("Field").map(str::len),
+                Some(MAX_LINE_BYTES - "Field: ".len()),
+                "{terminator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_one_past_ceiling_rejected() {
+        for terminator in ["\n", ""] {
+            let err = Deb822Reader::new(Cursor::new(line_of(MAX_LINE_BYTES + 1, terminator)))
                 .read_paragraph()
                 .unwrap_err();
             assert!(matches!(err, ParseError::LineTooLong { .. }), "{err:?}");
@@ -575,12 +587,22 @@ SHA256:
     }
 
     #[test]
-    fn line_exactly_at_ceiling_ok_when_bounded() {
-        let short = "Field: value\n";
-        Deb822Reader::new(Cursor::new(short))
+    fn multibyte_char_straddling_ceiling_rejected() {
+        let mut s = line_of(MAX_LINE_BYTES - 1, "");
+        s.push('é');
+        let err = Deb822Reader::new(Cursor::new(s))
             .read_paragraph()
-            .unwrap()
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, ParseError::LineTooLong { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn error_messages_escape_control_characters() {
+        let err = Deb822Reader::new(Cursor::new("no colon \x1b[2J here\n"))
+            .read_paragraph()
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\x1b'), "{err}");
     }
 
     #[test]

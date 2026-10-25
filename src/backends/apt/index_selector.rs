@@ -603,7 +603,8 @@ fn translation_wanted(sel: &I18nSelection, lang: &str) -> bool {
     match sel {
         I18nSelection::None => false,
         I18nSelection::All => true,
-        I18nSelection::Only(langs) => langs.iter().any(|l| l == lang),
+        // Upstream mixes case (`Translation-zh_CN`); configured case is free-form.
+        I18nSelection::Only(langs) => langs.iter().any(|l| l.eq_ignore_ascii_case(lang)),
     }
 }
 
@@ -1003,13 +1004,12 @@ mod tests {
     fn i18n_translations_by_lang_whitelist() {
         let checksums = mk_checksums(&[
             ("main/i18n/Translation-en.xz", 100),
-            ("main/i18n/Translation-zh_cn.xz", 60),
+            ("main/i18n/Translation-zh_CN.xz", 60),
             ("main/i18n/Translation-de.xz", 50),
         ]);
         let header = ReleaseHeader::default();
         let mut apt = apt_opts(&["main"], &["amd64"]);
-        // The config layer lowercases `Only` tags, matching Debian filenames.
-        apt.indexes.i18n = I18nSelection::Only(vec!["en".into(), "zh_cn".into()]);
+        apt.indexes.i18n = I18nSelection::Only(vec!["en".into(), "zh_CN".into()]);
         let sel = select_indexes(&header, &checksums, &apt);
         let langs: Vec<Option<&str>> = sel
             .groups
@@ -1018,24 +1018,29 @@ mod tests {
             .map(|g| g.language.as_deref())
             .collect();
         assert!(langs.contains(&Some("en")));
-        assert!(langs.contains(&Some("zh_cn")));
+        assert!(langs.contains(&Some("zh_CN")));
         assert!(!langs.contains(&Some("de")));
     }
 
-    /// The selector relies on the config layer to lowercase `Only` tags.
+    /// Upstream spells tags `zh_CN`/`pt_BR`; any configured case must match.
     #[test]
-    fn i18n_only_selector_is_case_sensitive_after_normalization() {
-        let checksums = mk_checksums(&[("main/i18n/Translation-zh_cn.xz", 60)]);
+    fn i18n_only_selector_matches_case_insensitively() {
+        let checksums = mk_checksums(&[
+            ("main/i18n/Translation-zh_CN.xz", 60),
+            ("main/i18n/Translation-pt_BR.xz", 50),
+            ("main/i18n/Translation-zh_TW.xz", 40),
+        ]);
         let header = ReleaseHeader::default();
         let mut apt = apt_opts(&["main"], &["amd64"]);
-        apt.indexes.i18n = I18nSelection::Only(vec!["zh_CN".into()]);
+        apt.indexes.i18n = I18nSelection::Only(vec!["zh_cn".into(), "PT_BR".into()]);
         let sel = select_indexes(&header, &checksums, &apt);
-        let translations = sel
+        let mut langs: Vec<&str> = sel
             .groups
             .iter()
-            .filter(|g| g.base_path.contains("Translation-"))
-            .count();
-        assert_eq!(translations, 0);
+            .filter_map(|g| g.language.as_deref())
+            .collect();
+        langs.sort_unstable();
+        assert_eq!(langs, vec!["pt_BR", "zh_CN"]);
     }
 
     #[test]
