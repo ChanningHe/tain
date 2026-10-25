@@ -3,6 +3,7 @@
 //! Content decoding is disabled and `Accept-Encoding: identity` is forced:
 //! `.gz`/`.xz` indexes must stay byte-identical to upstream.
 
+use std::error::Error as _;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue, IF_MODIFIED_SINCE
 use reqwest::{Client, Response};
 use url::Url;
 
+use super::guard::redirect_policy;
 use crate::config::model::GlobalConfig;
 
 /// Client build-time settings.
@@ -42,7 +44,7 @@ impl From<&GlobalConfig> for ClientConfig {
             bind_address: g.bind_address,
             connect_timeout: g.timeout.connect,
             idle_timeout: g.timeout.read_idle,
-            // Per-mirror `force_http1` is applied later by the engine.
+            // Per-mirror settings are applied later by the engine.
             http1_only: false,
         }
     }
@@ -54,17 +56,25 @@ impl From<&GlobalConfig> for ClientConfig {
 ///
 /// `ClientError::Build`, typically a TLS backend init failure.
 pub fn build_client(cfg: &ClientConfig) -> Result<Client, ClientError> {
+    client_builder(cfg)
+        .build()
+        .map_err(|e| ClientError::Build(e.to_string()))
+}
+
+fn client_builder(cfg: &ClientConfig) -> reqwest::ClientBuilder {
     let mut builder = Client::builder()
         .user_agent(cfg.user_agent.clone())
         .connect_timeout(cfg.connect_timeout)
-        // No total timeout: multi-GB files make any value wrong; stalls are
-        // caught by the read-idle + min-throughput watchdog.
+        // No total timeout: multi-GB files make any value wrong. The read
+        // timeout bounds the wait for response headers and each body read;
+        // slow-but-alive bodies are the watchdog's job.
+        .read_timeout(cfg.idle_timeout)
         .pool_idle_timeout(cfg.idle_timeout)
         .no_gzip()
         .no_brotli()
         .no_deflate()
         .no_zstd()
-        .redirect(reqwest::redirect::Policy::limited(10));
+        .redirect(redirect_policy());
 
     if let Some(ip) = cfg.bind_address {
         builder = builder.local_address(ip);
@@ -76,10 +86,7 @@ pub fn build_client(cfg: &ClientConfig) -> Result<Client, ClientError> {
         // The RFC-default 64 KiB stream window throttles many-small-file loads.
         builder = builder.http2_adaptive_window(true);
     }
-
     builder
-        .build()
-        .map_err(|e| ClientError::Build(e.to_string()))
 }
 
 /// `ETag` / `Last-Modified` from a previous fetch, for conditional GETs.
@@ -140,10 +147,7 @@ pub async fn fetch_get(
         req = req.header(IF_MODIFIED_SINCE, v);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| ClientError::Request(e.to_string()))?;
+    let response = req.send().await.map_err(request_error)?;
     let status = response.status();
     let headers = response.headers().clone();
     Ok(FetchResponse {
@@ -157,8 +161,49 @@ pub async fn fetch_get(
 pub enum ClientError {
     #[error("failed to build reqwest client: {0}")]
     Build(String),
+    /// Possibly transient: connect, timeout, reset.
     #[error("HTTP request failed: {0}")]
     Request(String),
+    /// Retrying cannot help: refused redirect or address, bad URL, TLS
+    /// certificate rejected.
+    #[error("HTTP request refused: {0}")]
+    Refused(String),
+}
+
+/// reqwest's top-level message hides the cause; keep the whole chain.
+fn request_error(e: reqwest::Error) -> ClientError {
+    let mut msg = e.to_string();
+    let mut permanent = e.is_builder() || e.is_redirect();
+    let mut source = e.source();
+    while let Some(s) = source {
+        permanent |= is_certificate_rejection(s);
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    if permanent {
+        ClientError::Refused(msg)
+    } else {
+        ClientError::Request(msg)
+    }
+}
+
+/// Whether `e` is, or wraps, `rustls::Error::InvalidCertificate`. The rustls
+/// error sits inside nested `io::Error`s whose `source()` skips the wrapped
+/// error, so descend through `get_ref()` instead.
+fn is_certificate_rejection(mut e: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if let Some(rustls::Error::InvalidCertificate(_)) = e.downcast_ref::<rustls::Error>() {
+            return true;
+        }
+        match e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => e = inner,
+            None => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +242,61 @@ mod tests {
             ..ClientConfig::default()
         };
         build_client(&cfg).unwrap();
+    }
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn certificate_rejection_is_found_through_nested_io_errors() {
+        use std::io::{Error, ErrorKind};
+        let bad_cert =
+            || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        // The shape hyper-rustls actually produces: io(Other, io(InvalidData, rustls)).
+        let nested = Error::other(Error::new(ErrorKind::InvalidData, bad_cert()));
+        assert!(is_certificate_rejection(&nested));
+        assert!(is_certificate_rejection(&bad_cert()));
+
+        let alert = Error::other(Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+        ));
+        assert!(!is_certificate_rejection(&alert));
+        // Mentioning certificates in text is not a certificate error.
+        let text = Error::other("GET /pool/c/ca-certificates/ca-certificates_1.deb");
+        assert!(!is_certificate_rejection(&text));
+    }
+
+    /// End-to-end through reqwest: a public-looking origin (resolved to a
+    /// local server) that 302s to 127.0.0.1 is refused, so the policy is wired.
+    #[tokio::test]
+    async fn client_refuses_redirect_from_public_origin_to_loopback() {
+        use axum::http::{StatusCode, header::LOCATION};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = format!("http://127.0.0.1:{}/secret", addr.port());
+        let router = axum::Router::new()
+            .route(
+                "/start",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    async move { (StatusCode::FOUND, [(LOCATION, target)]) }
+                }),
+            )
+            .route("/secret", axum::routing::get(|| async { "internal" }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = client_builder(&ClientConfig::default())
+            .resolve("mirror.example", addr)
+            .build()
+            .unwrap();
+        let url = u(&format!("http://mirror.example:{}/start", addr.port()));
+        let err = fetch_get(&client, &url, &CacheValidators::default())
+            .await
+            .expect_err("redirect into loopback must fail");
+        assert!(matches!(err, ClientError::Refused(_)), "{err:?}");
     }
 
     #[test]

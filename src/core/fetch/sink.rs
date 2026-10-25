@@ -100,7 +100,14 @@ pub struct HashingSink {
     bytes_written: u64,
     expected: DigestSet,
     expected_size: Option<u64>,
+    /// Hard ceiling on bytes written: the expected size, else
+    /// [`MAX_UNKNOWN_SIZE`].
+    limit: u64,
 }
+
+/// Cap for downloads whose size the metadata does not give (d-i
+/// `SHA256SUMS`), so a hostile upstream cannot fill the disk.
+pub const MAX_UNKNOWN_SIZE: u64 = 1 << 30;
 
 impl HashingSink {
     /// Large buffer: `tokio::fs` small writes are expensive.
@@ -148,13 +155,24 @@ impl HashingSink {
             bytes_written: 0,
             expected,
             expected_size,
+            limit: expected_size.unwrap_or(MAX_UNKNOWN_SIZE),
         })
     }
 
     /// # Errors
     ///
-    /// I/O errors, or `Contract` after `finish`.
+    /// `TooLarge` (temp removed) once the limit would be exceeded; I/O
+    /// errors; `Contract` after `finish`.
     pub async fn write(&mut self, chunk: &[u8]) -> Result<(), SinkError> {
+        let got = self.bytes_written.saturating_add(chunk.len() as u64);
+        if got > self.limit {
+            self.writer = None;
+            self.discard_tmp().await;
+            return Err(SinkError::TooLarge {
+                limit: self.limit,
+                got,
+            });
+        }
         let w = self
             .writer
             .as_mut()
@@ -274,6 +292,8 @@ pub enum SinkError {
     },
     #[error("size mismatch: expected {expected}, got {got}")]
     SizeMismatch { expected: u64, got: u64 },
+    #[error("body exceeds {limit} bytes (at least {got})")]
+    TooLarge { limit: u64, got: u64 },
     #[error("{algo:?} digest mismatch: expected `{expected}`, got `{got}`")]
     DigestMismatch {
         algo: DigestAlgo,
@@ -498,6 +518,43 @@ mod tests {
         sink.write(payload).await.unwrap();
         sink.finish().await.unwrap();
         assert!(nested.exists());
+    }
+
+    #[tokio::test]
+    async fn write_past_expected_size_fails_at_once_and_removes_tmp() {
+        let tmp = Tmp::new();
+        let path = tmp.file("over.bin");
+        let mut sink = HashingSink::new(path.clone(), expected_sha256_of(b"abcd"), Some(4))
+            .await
+            .unwrap();
+        sink.write(b"abc").await.unwrap();
+        let err = sink.write(b"de").await.unwrap_err();
+        assert!(
+            matches!(err, SinkError::TooLarge { limit: 4, got: 5 }),
+            "{err:?}"
+        );
+        assert!(!tmp_path_for(&path).exists(), "tmp must be removed");
+        assert!(matches!(
+            sink.write(b"x").await,
+            Err(SinkError::Contract(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_size_is_capped() {
+        let tmp = Tmp::new();
+        let path = tmp.file("nosize-cap.bin");
+        let mut sink = HashingSink::new(path.clone(), expected_sha256_of(b"x"), None)
+            .await
+            .unwrap();
+        assert_eq!(sink.limit, MAX_UNKNOWN_SIZE);
+        sink.limit = 8;
+        sink.write(&[0u8; 8]).await.unwrap();
+        let err = sink.write(&[0u8; 1]).await.unwrap_err();
+        assert!(
+            matches!(err, SinkError::TooLarge { limit: 8, got: 9 }),
+            "{err:?}"
+        );
     }
 
     #[test]

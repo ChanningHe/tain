@@ -8,7 +8,7 @@
 //! cap; successes regrow it one permit at a time.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -46,12 +46,19 @@ impl From<&GlobalConfig> for BudgetConfig {
     }
 }
 
+type HostMap = Arc<Mutex<HashMap<String, HostState>>>;
+
+fn lock(hosts: &HostMap) -> std::sync::MutexGuard<'_, HashMap<String, HostState>> {
+    // The map holds plain counters; a panic elsewhere cannot leave it torn.
+    hosts.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Global + per-host semaphores. Clones share state.
 #[derive(Debug, Clone)]
 pub struct Budget {
     global: Arc<Semaphore>,
     per_host_capacity: usize,
-    per_host: Arc<Mutex<HashMap<String, HostState>>>,
+    per_host: HostMap,
 }
 
 #[derive(Debug)]
@@ -59,10 +66,40 @@ struct HostState {
     /// Resized via `forget_permits` / `add_permits`.
     sem: Arc<Semaphore>,
     current_cap: usize,
+    /// Permits a shrink could not forget because they were checked out; that
+    /// many returning guards retire theirs instead of releasing them.
+    debt: usize,
     throttle_until: Option<Instant>,
     consecutive_successes: usize,
     throttles_since_last_success: usize,
     first_streak_throttle_at: Option<Instant>,
+}
+
+impl HostState {
+    fn new(cap: usize) -> Self {
+        Self {
+            sem: Arc::new(Semaphore::new(cap)),
+            current_cap: cap,
+            debt: 0,
+            throttle_until: None,
+            consecutive_successes: 0,
+            throttles_since_last_success: 0,
+            first_streak_throttle_at: None,
+        }
+    }
+
+    fn shrink_to(&mut self, cap: usize) {
+        let by = self.current_cap.saturating_sub(cap);
+        self.debt += by - self.sem.forget_permits(by);
+        self.current_cap -= by;
+    }
+
+    fn grow_by(&mut self, n: usize) {
+        let repaid = n.min(self.debt);
+        self.debt -= repaid;
+        self.sem.add_permits(n - repaid);
+        self.current_cap += n;
+    }
 }
 
 impl Budget {
@@ -83,15 +120,10 @@ impl Budget {
     pub async fn acquire(&self, url: &Url) -> Option<BudgetGuard> {
         let host = url.host_str()?.to_ascii_lowercase();
         let (host_sem, throttle_wait) = {
-            let mut map = self.per_host.lock().expect("per-host map mutex poisoned");
-            let entry = map.entry(host.clone()).or_insert_with(|| HostState {
-                sem: Arc::new(Semaphore::new(self.per_host_capacity)),
-                current_cap: self.per_host_capacity,
-                throttle_until: None,
-                consecutive_successes: 0,
-                throttles_since_last_success: 0,
-                first_streak_throttle_at: None,
-            });
+            let mut map = lock(&self.per_host);
+            let entry = map
+                .entry(host.clone())
+                .or_insert_with(|| HostState::new(self.per_host_capacity));
             let wait = entry.throttle_until.and_then(|dl| {
                 let now = Instant::now();
                 if dl > now {
@@ -118,8 +150,9 @@ impl Budget {
 
         Some(BudgetGuard {
             _global: global_permit,
-            _host: host_permit,
+            host_permit: Some(host_permit),
             host,
+            hosts: Arc::clone(&self.per_host),
         })
     }
 
@@ -130,15 +163,10 @@ impl Budget {
         let host = host.to_ascii_lowercase();
         let now = Instant::now();
         let deadline = now + retry_after;
-        let mut map = self.per_host.lock().expect("per-host map mutex poisoned");
-        let entry = map.entry(host.clone()).or_insert_with(|| HostState {
-            sem: Arc::new(Semaphore::new(self.per_host_capacity)),
-            current_cap: self.per_host_capacity,
-            throttle_until: None,
-            consecutive_successes: 0,
-            throttles_since_last_success: 0,
-            first_streak_throttle_at: None,
-        });
+        let mut map = lock(&self.per_host);
+        let entry = map
+            .entry(host.clone())
+            .or_insert_with(|| HostState::new(self.per_host_capacity));
         entry.throttles_since_last_success += 1;
         if entry.first_streak_throttle_at.is_none() {
             entry.first_streak_throttle_at = Some(now);
@@ -158,11 +186,7 @@ impl Budget {
                  pacer state so other mirrors sharing this host can proceed. Fix the failing \
                  mirror or its upstream before the next tick."
             );
-            let missing = self.per_host_capacity.saturating_sub(entry.current_cap);
-            if missing > 0 {
-                entry.sem.add_permits(missing);
-            }
-            entry.current_cap = self.per_host_capacity;
+            entry.grow_by(self.per_host_capacity.saturating_sub(entry.current_cap));
             entry.throttle_until = None;
             entry.consecutive_successes = 0;
             entry.throttles_since_last_success = 0;
@@ -176,19 +200,14 @@ impl Budget {
                 .map_or(deadline, |cur| cur.max(deadline)),
         );
         entry.consecutive_successes = 0;
-        let new_cap = (entry.current_cap / 2).max(1);
-        if new_cap < entry.current_cap {
-            let shrink_by = entry.current_cap - new_cap;
-            entry.sem.forget_permits(shrink_by);
-            entry.current_cap = new_cap;
-        }
+        entry.shrink_to((entry.current_cap / 2).max(1));
     }
 
     /// Record a success; every 10 in a row regrows the host cap by one.
     pub fn note_success(&self, host: &str) {
         let host = host.to_ascii_lowercase();
         const SUCCESSES_PER_GROWTH: usize = 10;
-        let mut map = self.per_host.lock().expect("per-host map mutex poisoned");
+        let mut map = lock(&self.per_host);
         let Some(entry) = map.get_mut(&host) else {
             return;
         };
@@ -200,16 +219,16 @@ impl Budget {
         entry.consecutive_successes += 1;
         if entry.consecutive_successes >= SUCCESSES_PER_GROWTH {
             entry.consecutive_successes = 0;
-            entry.sem.add_permits(1);
-            entry.current_cap += 1;
+            entry.grow_by(1);
         }
     }
 
     /// Current per-host cap; `None` for an unseen host.
     #[must_use]
     pub fn host_cap(&self, host: &str) -> Option<usize> {
-        let map = self.per_host.lock().ok()?;
-        map.get(&host.to_ascii_lowercase()).map(|s| s.current_cap)
+        lock(&self.per_host)
+            .get(&host.to_ascii_lowercase())
+            .map(|s| s.current_cap)
     }
 
     /// Global permits currently available.
@@ -221,15 +240,15 @@ impl Budget {
     /// Available permits for `host`; `None` for an unseen host.
     #[must_use]
     pub fn host_available(&self, host: &str) -> Option<usize> {
-        let map = self.per_host.lock().ok()?;
-        map.get(&host.to_ascii_lowercase())
+        lock(&self.per_host)
+            .get(&host.to_ascii_lowercase())
             .map(|s| s.sem.available_permits())
     }
 
     /// Backdate the streak start to test the circuit breaker.
     #[cfg(test)]
     pub(crate) fn __test_backdate_streak(&self, host: &str, dur: Duration) {
-        let mut map = self.per_host.lock().expect("mutex poisoned");
+        let mut map = lock(&self.per_host);
         if let Some(entry) = map.get_mut(&host.to_ascii_lowercase())
             && let Some(t) = entry.first_streak_throttle_at
         {
@@ -241,8 +260,25 @@ impl Budget {
 /// Holds both permits until dropped.
 pub struct BudgetGuard {
     _global: OwnedSemaphorePermit,
-    _host: OwnedSemaphorePermit,
+    /// `None` only during drop.
+    host_permit: Option<OwnedSemaphorePermit>,
     host: String,
+    hosts: HostMap,
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        let Some(permit) = self.host_permit.take() else {
+            return;
+        };
+        let mut map = lock(&self.hosts);
+        if let Some(entry) = map.get_mut(&self.host)
+            && entry.debt > 0
+        {
+            entry.debt -= 1;
+            permit.forget();
+        }
+    }
 }
 
 impl std::fmt::Debug for BudgetGuard {
@@ -475,6 +511,57 @@ mod tests {
         b.throttle_host("cdn", Duration::from_millis(1));
         // Breaker did not fire (it would restore cap to 4).
         assert_eq!(b.host_cap("cdn"), Some(1));
+    }
+
+    async fn hold_all(b: &Budget, n: usize) -> Vec<BudgetGuard> {
+        let mut held = Vec::new();
+        for _ in 0..n {
+            held.push(b.acquire(&url("http://origin/")).await.unwrap());
+        }
+        held
+    }
+
+    #[tokio::test]
+    async fn throttle_while_permits_held_never_inflates_capacity() {
+        let b = Budget::new(BudgetConfig {
+            global_parallel: 32,
+            host_connections: 8,
+        });
+        let held = hold_all(&b, 8).await;
+        b.throttle_host("origin", Duration::ZERO);
+        assert_eq!(b.host_cap("origin"), Some(4));
+        drop(held);
+        assert_eq!(b.host_available("origin"), Some(4), "cap is 4, not 8");
+
+        // Shrink with nothing held, then regrow while held.
+        b.throttle_host("origin", Duration::ZERO);
+        assert_eq!(b.host_available("origin"), Some(2));
+        let held = hold_all(&b, 2).await;
+        b.throttle_host("origin", Duration::ZERO);
+        assert_eq!(b.host_cap("origin"), Some(1));
+        for _ in 0..10 {
+            b.note_success("origin");
+        }
+        assert_eq!(b.host_cap("origin"), Some(2));
+        drop(held);
+        assert_eq!(b.host_available("origin"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn breaker_reset_repays_debt_before_adding_permits() {
+        let b = Budget::new(BudgetConfig {
+            global_parallel: 32,
+            host_connections: 4,
+        });
+        let held = hold_all(&b, 4).await;
+        for _ in 0..POISON_THROTTLE_STREAK {
+            b.throttle_host("origin", Duration::ZERO);
+        }
+        b.__test_backdate_streak("origin", POISON_STREAK_WINDOW + Duration::from_secs(1));
+        b.throttle_host("origin", Duration::ZERO);
+        assert_eq!(b.host_cap("origin"), Some(4));
+        drop(held);
+        assert_eq!(b.host_available("origin"), Some(4));
     }
 
     #[tokio::test]
