@@ -14,7 +14,6 @@
 #![cfg(unix)]
 
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +26,7 @@ use tokio::time::sleep;
 use crate::config::env::EnvSource;
 use crate::config::load::{LoadError, LoadMode, LoadOptions, load};
 use crate::config::model::Config;
+use crate::config::schedule;
 use crate::core::engine::{self, SyncOverrides};
 use crate::core::fetch::budget::{Budget, BudgetConfig};
 use crate::exit::ExitCode;
@@ -157,13 +157,14 @@ pub async fn run_async(mut run_opts: DaemonRunOptions<'_>) -> Result<ExitCode, D
         }
 
         let now = Local::now();
-        let next = match current_schedule.find_next_occurrence(&now, false) {
-            Ok(next) => next,
-            Err(err) => {
-                tracing::error!(%err, "cron scheduler returned no next occurrence; exiting");
-                return Ok(ExitCode::Success);
-            }
-        };
+        // Startup and reload reject such schedules; this is a backstop, and a
+        // config error so `Restart=on-failure` does not mask it.
+        let next = current_schedule
+            .find_next_occurrence(&now, false)
+            .map_err(|err| DaemonError::InvalidSchedule {
+                raw: current_schedule.as_str().to_owned(),
+                err: format!("no next occurrence ({err})"),
+            })?;
         let wait = (next - now).to_std().unwrap_or(Duration::from_secs(0));
         tracing::info!(next = %next.to_rfc3339(), wait_secs = wait.as_secs(), "next tick");
 
@@ -181,26 +182,20 @@ pub async fn run_async(mut run_opts: DaemonRunOptions<'_>) -> Result<ExitCode, D
             }
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received — reloading config");
-                match reload_config(&run_opts.reload_source, run_opts.env) {
-                    Ok(new_cfg) => {
-                        match parse_schedule(&new_cfg) {
-                            Ok(sched) => {
-                                current_schedule = sched;
-                                run_opts.config = new_cfg;
-                                tracing::info!(
-                                    schedule = %run_opts
-                                        .config
-                                        .global
-                                        .schedule
-                                        .as_deref()
-                                        .unwrap_or("<none>"),
-                                    "config reloaded"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::warn!(%err, "reloaded config has invalid schedule — keeping previous config");
-                            }
-                        }
+                match reload(&run_opts.reload_source, run_opts.env) {
+                    Ok((new_cfg, sched)) => {
+                        current_schedule = sched;
+                        run_opts.config = new_cfg;
+                        tracing::info!(
+                            mirrors = run_opts.config.mirrors.len(),
+                            schedule = %run_opts
+                                .config
+                                .global
+                                .schedule
+                                .as_deref()
+                                .unwrap_or("<none>"),
+                            "config reloaded"
+                        );
                     }
                     Err(err) => {
                         tracing::warn!(%err, "config reload failed — keeping previous config");
@@ -277,52 +272,140 @@ async fn sync_all(cfg: &Config) {
     }
 }
 
-/// Parse `global.schedule` into a [`Cron`].
+/// Parse `global.schedule` into a [`Cron`] that fires at least once more.
 ///
 /// # Errors
 ///
-/// `NoSchedule` if unset, `InvalidSchedule` if unparsable.
+/// `NoSchedule` if unset, `InvalidSchedule` if unparsable or never firing.
 pub fn parse_schedule(cfg: &Config) -> Result<Cron, DaemonError> {
     let raw = cfg
         .global
         .schedule
         .as_deref()
         .ok_or(DaemonError::NoSchedule)?;
-    Cron::from_str(raw).map_err(|err| DaemonError::InvalidSchedule {
-        raw: raw.to_owned(),
-        err: err.to_string(),
+    schedule::parse(raw).map_err(|e| DaemonError::InvalidSchedule {
+        raw: e.raw,
+        err: e.reason,
     })
 }
 
-fn reload_config(source: &ReloadSource, env: &dyn EnvSource) -> Result<Config, LoadError> {
-    match source {
-        ReloadSource::LoadOptions {
-            cli_config,
-            default_config_path,
-        } => {
-            let opts = LoadOptions {
-                cli_config: cli_config.as_deref(),
-                env,
-                default_config_path: default_config_path.as_deref(),
-            };
-            let (cfg, mode) = load(opts)?;
-            match mode {
-                LoadMode::Toml(path) => {
-                    tracing::debug!(config = %path.display(), "reloaded from TOML");
-                }
-                LoadMode::EnvSingleSource => {
-                    tracing::debug!("reloaded from TAIN_URL + TAIN_DISTS");
-                }
-            }
-            Ok(cfg)
-        }
+/// Why a `SIGHUP` reload was refused; the daemon keeps its current config.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    /// Includes `ConfigError::NoMirrors`.
+    #[error(transparent)]
+    Load(#[from] LoadError),
+    #[error("the new configuration has no `global.schedule`")]
+    NoSchedule,
+    #[error(transparent)]
+    InvalidSchedule(#[from] schedule::ScheduleError),
+}
+
+/// Load and fully validate a replacement config. The caller swaps it in
+/// only on `Ok`, so a bad file never replaces a working one.
+///
+/// # Errors
+///
+/// Load/validation failure, a missing or never-firing schedule, or no mirrors.
+pub fn reload(source: &ReloadSource, env: &dyn EnvSource) -> Result<(Config, Cron), ReloadError> {
+    let ReloadSource::LoadOptions {
+        cli_config,
+        default_config_path,
+    } = source;
+    let (cfg, mode) = load(LoadOptions {
+        cli_config: cli_config.as_deref(),
+        env,
+        default_config_path: default_config_path.as_deref(),
+    })?;
+    match mode {
+        LoadMode::Toml(path) => tracing::debug!(config = %path.display(), "reloaded from TOML"),
+        LoadMode::EnvSingleSource => tracing::debug!("reloaded from TAIN_URL + TAIN_DISTS"),
     }
+    cfg.require_mirrors().map_err(LoadError::from)?;
+    let raw = cfg
+        .global
+        .schedule
+        .as_deref()
+        .ok_or(ReloadError::NoSchedule)?;
+    let cron = schedule::parse(raw)?;
+    Ok((cfg, cron))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::GlobalConfig;
+    use crate::config::model::{ConfigError, GlobalConfig};
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    const MIRROR: &str = "[[mirror]]\nname = \"d\"\nurl = \"http://127.0.0.1:1/d\"\n\
+                          suites = [\"bookworm\"]\ncomponents = [\"main\"]\n\
+                          architectures = [\"amd64\"]\n";
+
+    /// Write `body` under a fresh temp dir and reload from it.
+    fn reload_from(tag: &str, body: &str) -> Result<(Config, Cron), ReloadError> {
+        let dir = std::env::temp_dir().join(format!("tain-reload-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tain.toml");
+        std::fs::write(&path, body).unwrap();
+        let source = ReloadSource::LoadOptions {
+            cli_config: Some(path),
+            default_config_path: None,
+        };
+        let res = reload(&source, &HashMap::<String, String>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+        res
+    }
+
+    #[test]
+    fn reload_accepts_valid_config() {
+        let (cfg, _) = reload_from(
+            "ok",
+            &format!("[global]\nschedule = \"0 * * * *\"\n{MIRROR}"),
+        )
+        .expect("valid reload");
+        assert_eq!(cfg.mirrors.len(), 1);
+    }
+
+    #[test]
+    fn reload_refuses_schedule_without_next_occurrence() {
+        let err = reload_from(
+            "never",
+            &format!("[global]\nschedule = \"0 0 30 2 *\"\n{MIRROR}"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ReloadError::InvalidSchedule(e) if e.raw == "0 0 30 2 *"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn reload_refuses_missing_schedule_bad_config_and_no_mirrors() {
+        let err = reload_from("nosched", MIRROR).unwrap_err();
+        assert!(matches!(err, ReloadError::NoSchedule), "{err:?}");
+        let err =
+            reload_from("bad", "[global]\nschedule = \"0 * * * *\"\nbogus = 1\n").unwrap_err();
+        assert!(matches!(err, ReloadError::Load(_)), "{err:?}");
+        let err = reload_from("empty", "[global]\nschedule = \"0 * * * *\"\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReloadError::Load(LoadError::Model(ConfigError::NoMirrors))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_rejects_never_firing_expression() {
+        let err = parse_schedule(&cfg_with_schedule(Some("0 0 30 2 *"))).unwrap_err();
+        assert!(
+            matches!(&err, DaemonError::InvalidSchedule { raw, .. } if raw == "0 0 30 2 *"),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), ExitCode::ConfigError);
+    }
 
     fn cfg_with_schedule(sched: Option<&str>) -> Config {
         let global = GlobalConfig {

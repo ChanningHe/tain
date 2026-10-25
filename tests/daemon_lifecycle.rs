@@ -195,46 +195,59 @@ async fn missing_schedule_is_exit_2() {
     assert_eq!(err.exit_code(), tain::exit::ExitCode::ConfigError);
 }
 
-#[tokio::test]
-async fn sighup_reloads_and_swaps_schedule() {
-    let _guard = SIGNAL_TESTS.lock().await;
+/// `io::Write` sink shared with the test, for asserting on daemon logs.
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    let cfg_dir = TempDir::new("daemon-sighup-cfg");
-    let target = TempDir::new("daemon-sighup-target");
-    let cfg_path = cfg_dir.path().join("tain.toml");
-    let initial_toml = format!(
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn daemon_toml(target: &std::path::Path, schedule: &str) -> String {
+    format!(
         r#"[global]
 target = "{}"
 parallel = 4
 host_connections = 2
-schedule = "0 * * * *"
+schedule = "{schedule}"
+
+[[mirror]]
+name = "debian"
+url = "http://127.0.0.1:1/debian"
+suites = ["bookworm"]
+components = ["main"]
+architectures = ["amd64"]
 "#,
-        target.path().display()
-    );
-    std::fs::write(&cfg_path, &initial_toml).unwrap();
+        target.display()
+    )
+}
+
+/// Start the daemon on `initial`, rewrite the file to `reloaded`, send
+/// SIGHUP then SIGTERM, and return the daemon's log output.
+async fn run_with_reload(tag: &str, initial: &str, reloaded: &str) -> String {
+    let cfg_dir = TempDir::new(&format!("daemon-{tag}-cfg"));
+    let target = TempDir::new(&format!("daemon-{tag}-target"));
+    let cfg_path = cfg_dir.path().join("tain.toml");
+    std::fs::write(&cfg_path, daemon_toml(target.path(), initial)).unwrap();
 
     // Reload locates the TOML via TAIN_CONFIG.
-    struct EnvWithConfig(HashMap<String, String>);
-    impl EnvSource for EnvWithConfig {
-        fn get(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
-    }
-    let mut env_map = HashMap::new();
-    env_map.insert(
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert(
         "TAIN_CONFIG".to_owned(),
         cfg_path.to_string_lossy().into_owned(),
     );
-    let env = EnvWithConfig(env_map);
-
-    let load_opts = tain::config::load::LoadOptions {
+    let (cfg, _mode) = tain::config::load::load(tain::config::load::LoadOptions {
         cli_config: None,
         env: &env,
         default_config_path: None,
-    };
-    let (cfg, _mode) = tain::config::load::load(load_opts).unwrap();
-    assert_eq!(cfg.global.schedule.as_deref(), Some("0 * * * *"));
-
+    })
+    .unwrap();
     let run_opts = DaemonRunOptions {
         config: cfg,
         reload_source: ReloadSource::LoadOptions {
@@ -247,31 +260,68 @@ schedule = "0 * * * *"
         },
     };
 
-    let reloaded_toml = format!(
-        r#"[global]
-target = "{}"
-parallel = 4
-host_connections = 2
-schedule = "0 0 1 1 *"
-"#,
-        target.path().display()
-    );
-    let cfg_path_clone = cfg_path.clone();
+    let reloaded_toml = daemon_toml(target.path(), reloaded);
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        std::fs::write(&cfg_path_clone, &reloaded_toml).unwrap();
+        std::fs::write(&cfg_path, &reloaded_toml).unwrap();
         kill_self(libc::SIGHUP);
         tokio::time::sleep(Duration::from_millis(400)).await;
         kill_self(libc::SIGTERM);
     });
+
+    // `#[tokio::test]` is single-threaded, so a thread-local subscriber
+    // sees everything the daemon logs.
+    let capture = Capture::default();
+    let sink = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    let _log = tracing::subscriber::set_default(subscriber);
 
     let code = tokio::time::timeout(Duration::from_secs(5), run_async(run_opts))
         .await
         .expect("daemon must exit within 5s")
         .expect("daemon must return Ok");
     assert_eq!(code, tain::exit::ExitCode::Success);
-    // Only proves SIGHUP -> reload -> parse runs end to end; a failed
-    // reload keeps the old config and would also exit cleanly.
+    let logs = capture.0.lock().unwrap().clone();
+    String::from_utf8(logs).unwrap()
+}
+
+/// `next` timestamp (local RFC 3339) of the last `next tick` line.
+fn last_next_tick(logs: &str) -> &str {
+    let line = logs
+        .lines()
+        .rfind(|l| l.contains("next tick"))
+        .unwrap_or_else(|| panic!("no `next tick` line:\n{logs}"));
+    let value = line.split("next=").nth(1).unwrap();
+    value.split_whitespace().next().unwrap()
+}
+
+// Far-future schedules (Jan 1 / Feb 29) so no real tick races the test;
+// the next-tick date shows which schedule is active.
+const JAN_1: &str = "0 0 1 1 *";
+
+#[tokio::test]
+async fn sighup_reloads_and_swaps_schedule() {
+    let _guard = SIGNAL_TESTS.lock().await;
+    let logs = run_with_reload("sighup-ok", JAN_1, "0 0 29 2 *").await;
+    assert!(logs.contains("config reloaded"), "{logs}");
+    assert!(logs.contains("schedule=0 0 29 2 *"), "{logs}");
+    assert!(!logs.contains("config reload failed"), "{logs}");
+    assert_eq!(logs.matches("next tick").count(), 2, "{logs}");
+    assert!(last_next_tick(&logs).contains("-02-29T00:00:00"), "{logs}");
+}
+
+#[tokio::test]
+async fn sighup_with_never_firing_schedule_keeps_old_config() {
+    let _guard = SIGNAL_TESTS.lock().await;
+    let logs = run_with_reload("sighup-bad", JAN_1, "0 0 30 2 *").await;
+    assert!(logs.contains("config reload failed"), "{logs}");
+    assert!(logs.contains("0 0 30 2 *"), "{logs}");
+    assert!(!logs.contains("config reloaded"), "{logs}");
+    assert_eq!(logs.matches("next tick").count(), 2, "{logs}");
+    assert!(last_next_tick(&logs).contains("-01-01T00:00:00"), "{logs}");
 }
 
 #[tokio::test]

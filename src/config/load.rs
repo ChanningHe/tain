@@ -78,6 +78,14 @@ pub fn load(opts: LoadOptions<'_>) -> Result<(Config, LoadMode), LoadError> {
             err,
         })?;
         let cfg = toml_source::parse(&text)?;
+        let ignored = env::single_source_vars_set(opts.env);
+        if !ignored.is_empty() {
+            tracing::warn!(
+                "{} only apply in single-mirror mode and are ignored because a TOML config is in \
+                 use",
+                ignored.join(", ")
+            );
+        }
         (cfg, LoadMode::Toml(path))
     } else if opts.env.get("TAIN_URL").is_some_and(|s| !s.is_empty()) {
         let single = env::try_single_source(opts.env)?
@@ -88,8 +96,20 @@ pub fn load(opts: LoadOptions<'_>) -> Result<(Config, LoadMode), LoadError> {
     };
 
     GlobalOverrides::from_env(opts.env)?.apply(&mut cfg.global);
+    // Again after the overrides: `TAIN_TARGET` can invalidate the target.
+    cfg.validate()?;
+    validate_backends(&cfg)?;
 
     Ok((cfg, mode))
+}
+
+/// Run each mirror's backend `validate_config`, so `check` rejects what
+/// `sync` would only discover mid-run.
+fn validate_backends(cfg: &Config) -> Result<(), ConfigError> {
+    for m in &cfg.mirrors {
+        crate::backends::dispatch(m).map_err(|e| ConfigError::Backend(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn build_from_single_source(single: EnvSingleSource) -> Result<Config, LoadError> {
@@ -100,9 +120,7 @@ fn build_from_single_source(single: EnvSingleSource) -> Result<Config, LoadError
     for partial in single.mirrors {
         mirrors.push(resolve_mirror(partial, &defaults)?);
     }
-    let cfg = Config { global, mirrors };
-    cfg.validate()?;
-    Ok(cfg)
+    Ok(Config { global, mirrors })
 }
 
 #[cfg(test)]
@@ -244,7 +262,7 @@ mod tests {
         std::fs::write(
             &path,
             "[global]\ntarget = \"/data\"\nparallel = 16\n\n\
-             [[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\narchitectures = [\"amd64\"]\n",
+             [[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\ncomponents = [\"main\"]\narchitectures = [\"amd64\"]\n",
         )
         .unwrap();
         let e = env(&[]);
@@ -266,7 +284,7 @@ mod tests {
         std::fs::write(
             &path,
             "[global]\nparallel = 32\n\n\
-             [[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\narchitectures = [\"amd64\"]\n",
+             [[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\ncomponents = [\"main\"]\narchitectures = [\"amd64\"]\n",
         )
         .unwrap();
         let e = env(&[("TAIN_PARALLEL", "4")]);
@@ -316,7 +334,7 @@ mod tests {
         let path = dir.path().join("via-env.toml");
         std::fs::write(
             &path,
-            "[[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\narchitectures = [\"amd64\"]\n",
+            "[[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\ncomponents = [\"main\"]\narchitectures = [\"amd64\"]\n",
         )
         .unwrap();
         let e = env(&[("TAIN_CONFIG", path.to_str().unwrap())]);
@@ -353,7 +371,7 @@ mod tests {
         let path = dir.path().join("default.toml");
         std::fs::write(
             &path,
-            "[[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\narchitectures = [\"amd64\"]\n",
+            "[[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\ncomponents = [\"main\"]\narchitectures = [\"amd64\"]\n",
         )
         .unwrap();
         let e = env(&[]);
@@ -426,6 +444,110 @@ mod tests {
         };
         let err = load(opts).unwrap_err();
         assert!(matches!(err, LoadError::Io { .. }));
+    }
+
+    fn load_toml(text: &str, pairs: &[(&str, &str)]) -> Result<(Config, LoadMode), LoadError> {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        let e = env(pairs);
+        load(LoadOptions {
+            cli_config: Some(&path),
+            env: &e,
+            default_config_path: None,
+        })
+    }
+
+    const MIRROR: &str = "[[mirror]]\nname = \"d\"\nurl = \"http://x\"\nsuites = [\"bookworm\"]\n\
+                          components = [\"main\"]\narchitectures = [\"amd64\"]\n";
+
+    fn backend_error(res: Result<(Config, LoadMode), LoadError>) -> String {
+        match res {
+            Err(LoadError::Model(ConfigError::Backend(msg))) => msg,
+            other => panic!("expected backend config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backend_validation_runs_at_load_in_both_modes() {
+        let no_components = MIRROR.replace("components = [\"main\"]\n", "");
+        let msg = backend_error(load_toml(&no_components, &[]));
+        assert!(msg.contains("at least one component"), "{msg}");
+
+        let unsafe_suite = MIRROR.replace("[\"bookworm\"]", "[\"../../../etc\"]");
+        let msg = backend_error(load_toml(&unsafe_suite, &[]));
+        assert!(msg.contains("unsafe path"), "{msg}");
+
+        let msg = backend_error(load_env_only(&[
+            ("TAIN_URL", "http://example.com/repo"),
+            ("TAIN_DISTS", "bookworm||amd64"),
+        ]));
+        assert!(msg.contains("at least one component"), "{msg}");
+    }
+
+    #[cfg(not(feature = "pgp"))]
+    #[test]
+    fn pgp_required_rejected_at_load_without_pgp_feature() {
+        let text = format!("{MIRROR}[mirror.verify]\npgp = \"required\"\nkeyring = \"/k.gpg\"\n");
+        let msg = backend_error(load_toml(&text, &[]));
+        assert!(msg.contains("`pgp` feature"), "{msg}");
+    }
+
+    #[test]
+    fn empty_or_relative_target_rejected_after_env_overrides() {
+        let err = load_toml(MIRROR, &[("TAIN_TARGET", "")]).unwrap_err();
+        assert!(
+            matches!(err, LoadError::Model(ConfigError::InvalidTarget(_))),
+            "{err:?}"
+        );
+        let text = format!("[global]\ntarget = \"rel\"\n{MIRROR}");
+        let err = load_toml(&text, &[]).unwrap_err();
+        assert!(
+            matches!(err, LoadError::Model(ConfigError::InvalidTarget(_))),
+            "{err:?}"
+        );
+        // Only the final value counts: an env override repairs a bad TOML target.
+        let (cfg, _) = load_toml(&text, &[("TAIN_TARGET", "/srv/x")]).unwrap();
+        assert_eq!(cfg.global.target, PathBuf::from("/srv/x"));
+    }
+
+    #[test]
+    fn env_mode_rejects_unsafe_and_shared_paths() {
+        let err = load_env_only(&[
+            ("TAIN_URL", "http://example.com/repo"),
+            ("TAIN_DISTS", "bookworm|main|amd64"),
+            ("TAIN_PATH", "../escape"),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, LoadError::Model(ConfigError::InvalidPath { .. })),
+            "{err:?}"
+        );
+        let err = load_env_only(&[
+            ("TAIN_URL", "http://example.com/repo"),
+            (
+                "TAIN_DISTS",
+                "bookworm|main|amd64|same;trixie|main|amd64|same",
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, LoadError::Model(ConfigError::DuplicatePath { .. })),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn env_mode_rejects_non_http_url() {
+        let err = load_env_only(&[
+            ("TAIN_URL", "ftp://example.com/repo"),
+            ("TAIN_DISTS", "bookworm|main|amd64"),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, LoadError::Model(ConfigError::UnsupportedScheme { .. })),
+            "{err:?}"
+        );
     }
 
     struct TempDir(PathBuf);

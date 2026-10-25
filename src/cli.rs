@@ -73,14 +73,15 @@ pub struct StatusArgs {
     /// Emit machine-readable JSON instead of the human summary.
     #[arg(long)]
     pub json: bool,
-    /// Exit 0 only if the last successful sync is within this duration (e.g. `48h`).
+    /// Exit 0 only if the upstream Release `Date` of the most recently
+    /// published suite is within this duration of now (e.g. `48h`).
     #[arg(long, value_name = "DUR")]
     pub healthy_within: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ImportCommand {
-    /// Convert an apt-mirror style `mirrors.list` to Tain TOML on stdout.
+    /// Convert an apt-mirror `mirror.list` (e.g. `/etc/apt/mirror.list`) to Tain TOML on stdout.
     #[command(name = "mirrors-list")]
     MirrorsList {
         /// Source file. Use `-` to read from stdin.
@@ -188,11 +189,11 @@ mod tests {
 
     #[test]
     fn import_mirrors_list_positional() {
-        let cli = Cli::try_parse_from(["tain", "import", "mirrors-list", "/etc/apt/mirrors.list"])
+        let cli = Cli::try_parse_from(["tain", "import", "mirrors-list", "/etc/apt/mirror.list"])
             .unwrap();
         match cli.command {
             Command::Import(ImportCommand::MirrorsList { file }) => {
-                assert_eq!(file, std::path::PathBuf::from("/etc/apt/mirrors.list"));
+                assert_eq!(file, std::path::PathBuf::from("/etc/apt/mirror.list"));
             }
             other => panic!("wrong variant: {other:?}"),
         }

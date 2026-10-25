@@ -7,7 +7,8 @@ use clap::Parser;
 use tain::cli::{Cli, Command, DaemonArgs, ImportCommand, StatusArgs, SyncArgs, VerifyArgs};
 use tain::config::env::ProcessEnv;
 use tain::config::load::{DEFAULT_CONFIG_PATH, LoadError, LoadMode, LoadOptions, load};
-use tain::config::{Config, display as config_display, mirrors_list};
+use tain::config::model::MirrorConfig;
+use tain::config::{Config, display as config_display, mirrors_list, schedule};
 use tain::core::engine;
 use tain::exit::ExitCode as TainExit;
 use tain::observe::metrics::{GcMetrics, PgpMetric, SyncMetrics, write_textfile};
@@ -28,10 +29,7 @@ fn main() -> ExitCode {
     // `TAIN_LOG_*`-only subscriber before installing the global one.
     let loaded = match observe::with_scoped(&env_log, || load_config(cli.config.as_deref())) {
         Ok(loaded) => loaded,
-        Err(err) => {
-            eprintln!("tain: failed to install tracing subscriber: {err}");
-            return TainExit::ConfigError.into();
-        }
+        Err(err) => return log_init_failed(&env_log, &err),
     };
     // `load` already folded `TAIN_LOG_*` overrides into `cfg.global.log`.
     let log_cfg = match &loaded {
@@ -52,8 +50,7 @@ fn main() -> ExitCode {
 
 fn init_logging(cfg: &LogConfig, cli: &Cli) -> Result<(), ExitCode> {
     if let Err(err) = observe::init(cfg) {
-        eprintln!("tain: failed to install tracing subscriber: {err}");
-        return Err(TainExit::ConfigError.into());
+        return Err(log_init_failed(cfg, &err));
     }
     tracing::debug!(
         version = env!("CARGO_PKG_VERSION"),
@@ -61,6 +58,21 @@ fn init_logging(cfg: &LogConfig, cli: &Cli) -> Result<(), ExitCode> {
         "tain start"
     );
     Ok(())
+}
+
+/// No subscriber exists yet, so this goes straight to stderr.
+fn log_init_failed(cfg: &LogConfig, err: &observe::InitError) -> ExitCode {
+    match err {
+        observe::InitError::Filter(reason) => eprintln!(
+            "tain: config error: invalid log level `{}` (`log_level` / `TAIN_LOG_LEVEL`): \
+             {reason}",
+            cfg.filter.as_deref().unwrap_or_default()
+        ),
+        observe::InitError::Install(_) => {
+            eprintln!("tain: failed to install tracing subscriber: {err}");
+        }
+    }
+    TainExit::ConfigError.into()
 }
 
 fn load_config(cli_config: Option<&Path>) -> Result<(Config, LoadMode), LoadError> {
@@ -72,6 +84,13 @@ fn load_config(cli_config: Option<&Path>) -> Result<(Config, LoadMode), LoadErro
 }
 
 fn dispatch(cli: &Cli, cfg: Config, mode: LoadMode) -> ExitCode {
+    // Only `check` may run on a config with nothing to do.
+    if !matches!(cli.command, Command::Check)
+        && let Err(err) = cfg.require_mirrors()
+    {
+        tracing::error!(%err, "config load failed");
+        return TainExit::ConfigError.into();
+    }
     match &cli.command {
         Command::Import(ImportCommand::MirrorsList { file }) => run_import_mirrors_list(file),
         Command::Check => run_check(&cfg, mode),
@@ -82,7 +101,36 @@ fn dispatch(cli: &Cli, cfg: Config, mode: LoadMode) -> ExitCode {
     }
 }
 
+/// Mirrors named by `--mirror` (all when none), or `ConfigError` on an
+/// unknown name so a typo never turns into a silent no-op.
+fn select_mirrors<'a>(
+    cfg: &'a Config,
+    names: &[String],
+) -> Result<Vec<&'a MirrorConfig>, ExitCode> {
+    if let Some(unknown) = names
+        .iter()
+        .find(|n| !cfg.mirrors.iter().any(|m| &m.name == *n))
+    {
+        let known: Vec<&str> = cfg.mirrors.iter().map(|m| m.name.as_str()).collect();
+        tracing::error!(
+            mirror = %unknown,
+            configured = %known.join(", "),
+            "--mirror names no configured mirror"
+        );
+        return Err(TainExit::ConfigError.into());
+    }
+    Ok(cfg
+        .mirrors
+        .iter()
+        .filter(|m| names.is_empty() || names.contains(&m.name))
+        .collect())
+}
+
 fn run_sync(cfg: &Config, args: &SyncArgs) -> ExitCode {
+    let mirrors = match select_mirrors(cfg, &args.mirrors) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -94,7 +142,6 @@ fn run_sync(cfg: &Config, args: &SyncArgs) -> ExitCode {
         }
     };
 
-    let filter: Vec<&str> = args.mirrors.iter().map(String::as_str).collect();
     let mut any_success = false;
     let mut any_failure = false;
     let mut lock_contention = false;
@@ -119,10 +166,7 @@ fn run_sync(cfg: &Config, args: &SyncArgs) -> ExitCode {
         tain::core::fetch::budget::BudgetConfig::from(&cfg.global),
     );
     rt.block_on(async {
-        for mirror in &cfg.mirrors {
-            if !filter.is_empty() && !filter.iter().any(|f| *f == mirror.name) {
-                continue;
-            }
+        for &mirror in &mirrors {
             tracing::info!(mirror = %mirror.name, url = %mirror.url, "syncing");
             match engine::sync_mirror_with_budget(
                 &cfg.global,
@@ -240,12 +284,12 @@ fn run_daemon(_cli_config: Option<&Path>, _cfg: Config, _args: &DaemonArgs) -> E
 }
 
 fn run_verify(cfg: &Config, args: &VerifyArgs) -> ExitCode {
-    let filter: Vec<&str> = args.mirrors.iter().map(String::as_str).collect();
+    let mirrors = match select_mirrors(cfg, &args.mirrors) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
     let mut any_problem = false;
-    for mirror in &cfg.mirrors {
-        if !filter.is_empty() && !filter.iter().any(|f| *f == mirror.name) {
-            continue;
-        }
+    for mirror in mirrors {
         let mirror_root = cfg.global.target.join(&mirror.path);
         match tain::core::engine::verify::scrub_latest(&mirror_root) {
             Ok(report) => {
@@ -333,6 +377,11 @@ fn run_check(cfg: &Config, mode: LoadMode) -> ExitCode {
             tracing::info!("config assembled from TAIN_URL + TAIN_DISTS");
         }
     }
+    // `sync` ignores the schedule, so load does not check it; `check` must.
+    if let Some(Err(err)) = cfg.global.schedule.as_deref().map(schedule::parse) {
+        tracing::error!(%err, "global.schedule is invalid");
+        return TainExit::ConfigError.into();
+    }
     print!("{}", config_display::format_config(cfg));
     TainExit::Success.into()
 }
@@ -348,25 +397,21 @@ fn run_import_mirrors_list(path: &Path) -> ExitCode {
     let text = match read_file_or_stdin(path) {
         Ok(t) => t,
         Err(err) => {
-            tracing::error!(path = %path.display(), %err, "cannot read mirrors.list");
+            tracing::error!(path = %path.display(), %err, "cannot read mirror.list");
             return TainExit::FatalIo.into();
         }
     };
     match mirrors_list::parse(&text) {
         Ok(entries) => {
-            for d in mirrors_list::flat_entries(&entries) {
-                tracing::warn!(
-                    line = d.line,
-                    "flat repositories are not supported yet; the line is commented out in \
-                     the generated TOML"
-                );
+            let conversion = mirrors_list::convert(&entries);
+            for warning in &conversion.warnings {
+                tracing::warn!("{warning}; see the comment in the generated TOML");
             }
-            let toml = mirrors_list::to_toml(&entries);
-            print!("{toml}");
+            print!("{}", conversion.toml);
             TainExit::Success.into()
         }
         Err(err) => {
-            tracing::error!(%err, "mirrors.list parse failed");
+            tracing::error!(%err, "mirror.list parse failed");
             TainExit::ConfigError.into()
         }
     }

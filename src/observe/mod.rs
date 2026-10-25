@@ -3,12 +3,13 @@
 
 pub mod metrics;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::str::FromStr;
 
 use tracing::Level;
 use tracing_subscriber::{
     EnvFilter,
+    filter::LevelFilter,
     fmt::{self, format::FmtSpan},
     prelude::*,
 };
@@ -79,12 +80,22 @@ pub fn with_scoped<T>(cfg: &LogConfig, f: impl FnOnce() -> T) -> Result<T, InitE
 
 type BoxedSubscriber = Box<dyn tracing::Subscriber + Send + Sync>;
 
+/// Colour only on a terminal (never into journald, docker logs or files),
+/// and not when `NO_COLOR` is set to a non-empty value (no-color.org).
+fn use_ansi(stderr_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stderr_is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
 fn build_subscriber(cfg: &LogConfig) -> Result<BoxedSubscriber, InitError> {
     let filter = build_filter(cfg.filter.as_deref())?;
     let registry = tracing_subscriber::registry().with(filter);
     let layer = fmt::layer()
         .with_target(true)
         .with_span_events(FmtSpan::NONE)
+        .with_ansi(use_ansi(
+            io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .with_writer(io::stderr as fn() -> io::Stderr);
     Ok(match cfg.format {
         LogFormat::Text => Box::new(registry.with(layer)),
@@ -101,9 +112,43 @@ fn build_filter(directives: Option<&str>) -> Result<EnvFilter, InitError> {
             .parse_lossy("")),
         Some(s) => EnvFilter::builder()
             .with_default_directive(default_level.into())
-            .parse(s)
+            .parse(normalize_directives(s)?)
             .map_err(|e| InitError::Filter(e.to_string())),
     }
+}
+
+/// EnvFilter reads a bare word as a target name, so a misspelled level
+/// (`warnn`) would silently filter out every log line. Bare words must be
+/// levels; `warning` is accepted for `warn`, also after `target=`.
+fn normalize_directives(s: &str) -> Result<String, InitError> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(normalize_directive)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|v| v.join(","))
+}
+
+fn normalize_directive(d: &str) -> Result<String, InitError> {
+    if let Some((target, level)) = d.rsplit_once('=') {
+        return Ok(if level.eq_ignore_ascii_case("warning") {
+            format!("{target}=warn")
+        } else {
+            d.to_owned()
+        });
+    }
+    if d.eq_ignore_ascii_case("warning") {
+        return Ok("warn".to_owned());
+    }
+    // `[span]` filters and `a::b` targets are deliberate; plain words are not.
+    if d.contains("::") || d.contains('[') || d.parse::<LevelFilter>().is_ok() {
+        return Ok(d.to_owned());
+    }
+    Err(InitError::Filter(format!(
+        "`{}` is not a level (trace, debug, info, warn, error, off); \
+         use `target=level` to filter a module",
+        d.escape_debug()
+    )))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +162,16 @@ pub enum InitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ansi_only_on_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(use_ansi(true, None));
+        assert!(!use_ansi(false, None));
+        assert!(!use_ansi(true, Some(OsStr::new("1"))));
+        // https://no-color.org: an empty NO_COLOR does not disable colour.
+        assert!(use_ansi(true, Some(OsStr::new(""))));
+    }
 
     #[test]
     fn parses_known_formats() {
@@ -164,6 +219,34 @@ mod tests {
             with_scoped(&cfg, || ()),
             Err(InitError::Filter(_))
         ));
+    }
+
+    #[test]
+    fn bare_words_must_be_levels() {
+        for bad in ["nonsense", "bogus!!", "tain", "info,loud"] {
+            let err = build_filter(Some(bad)).unwrap_err();
+            assert!(matches!(err, InitError::Filter(_)), "{bad}: {err:?}");
+        }
+        for good in [
+            "info",
+            "WARN",
+            "off",
+            "debug,tain::core=trace",
+            "tain=debug",
+        ] {
+            assert!(build_filter(Some(good)).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn warning_is_an_alias_for_warn() {
+        assert_eq!(normalize_directives("warning").unwrap(), "warn");
+        assert_eq!(normalize_directives("WARNING").unwrap(), "warn");
+        assert_eq!(
+            normalize_directives("info, tain::core=Warning").unwrap(),
+            "info,tain::core=warn"
+        );
+        assert!(build_filter(Some("warning")).is_ok());
     }
 
     #[test]

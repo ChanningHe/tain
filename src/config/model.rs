@@ -4,7 +4,7 @@
 //! finalize via `build` (still-`None` fields take hardcoded defaults).
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use url::Url;
@@ -20,6 +20,10 @@ pub const DEFAULT_PARALLEL: usize = 32;
 pub const DEFAULT_HOST_CONNECTIONS: usize = 8;
 
 pub const DEFAULT_SEGMENTS_PER_FILE: usize = 4;
+
+/// Upper bound of `segments_per_file`; more connections per file only
+/// burden the upstream.
+pub const MAX_SEGMENTS_PER_FILE: usize = 8;
 
 pub const DEFAULT_RETRY_COUNT: u32 = 3;
 
@@ -441,7 +445,7 @@ impl PartialAptOptions {
             })?;
         Ok(AptOptions {
             suites,
-            // Empty components are allowed here and fail at sync time.
+            // Empty components are rejected by the backend's `validate_config` at load.
             components: self.components.unwrap_or_default(),
             architectures,
             indexes: self.indexes.build(),
@@ -496,30 +500,19 @@ impl PartialIndexSelection {
     }
 }
 
-/// Lowercase and dedup `Only` language tags, warning if any changed. Debian
-/// ships lowercase `Translation-<lang>.xz`, so downstream can compare bytewise.
+/// Dedup `Only` language tags case-insensitively, keeping the first spelling.
+/// Upstream tags are mixed-case (`Translation-zh_CN`), so the index selector
+/// matches case-insensitively and the configured spelling is kept as written.
 #[must_use]
 pub fn normalize_i18n(sel: I18nSelection) -> I18nSelection {
     let I18nSelection::Only(langs) = sel else {
         return sel;
     };
-    let mut any_case_changed = false;
     let mut normalized: Vec<String> = Vec::with_capacity(langs.len());
-    for original in langs {
-        let lower = original.to_ascii_lowercase();
-        if lower != original {
-            any_case_changed = true;
+    for lang in langs {
+        if !normalized.iter().any(|l| l.eq_ignore_ascii_case(&lang)) {
+            normalized.push(lang);
         }
-        if !normalized.iter().any(|existing| existing == &lower) {
-            normalized.push(lower);
-        }
-    }
-    if any_case_changed {
-        tracing::warn!(
-            "i18n language tags normalized to lowercase for upstream matching (Debian ships \
-             `Translation-<lang>.xz` with lowercase tags); update your config to silence this \
-             warning"
-        );
     }
     I18nSelection::Only(normalized)
 }
@@ -591,19 +584,195 @@ pub enum ConfigError {
         pgp.as_str()
     )]
     PgpWithoutKeyring { mirror: String, pgp: PgpMode },
+    #[error(
+        "global.target must be a non-empty absolute path (from TOML or `TAIN_TARGET`), got `{}`",
+        .0.display()
+    )]
+    InvalidTarget(PathBuf),
+    #[error("mirror name {0:?} must not contain control characters")]
+    InvalidName(String),
+    #[error(
+        "the configuration defines no mirrors; add a [[mirror]] block or set TAIN_URL + \
+         TAIN_DISTS"
+    )]
+    NoMirrors,
+    #[error("mirror `{mirror}`: {field} value {value:?} must not contain control characters")]
+    ControlChars {
+        mirror: String,
+        field: &'static str,
+        value: String,
+    },
+    // Paths print with `{:?}` so control characters arrive escaped.
+    #[error(
+        "mirror `{mirror}`: path {path:?} {reason} (the path is relative to global.target and \
+         defaults to the mirror name)"
+    )]
+    InvalidPath {
+        mirror: String,
+        path: PathBuf,
+        reason: &'static str,
+    },
+    #[error(
+        "mirrors `{first}` and `{second}` share directory {path:?}; each mirror needs its own path"
+    )]
+    DuplicatePath {
+        first: String,
+        second: String,
+        path: PathBuf,
+    },
+    #[error(
+        "mirror `{inner}` (path {inner_path:?}) is nested inside mirror `{outer}` (path \
+         {outer_path:?}); mirror directories must not overlap"
+    )]
+    NestedPath {
+        outer: String,
+        outer_path: PathBuf,
+        inner: String,
+        inner_path: PathBuf,
+    },
+    #[error("mirror `{mirror}`: url `{url}` must use http or https")]
+    UnsupportedScheme { mirror: String, url: String },
+    /// Rejected by the backend's `validate_config`.
+    #[error("{0}")]
+    Backend(String),
+    #[error(
+        "segments_per_file (`TAIN_SEGMENTS`) must be between 1 and {MAX_SEGMENTS_PER_FILE}, \
+         got {0}"
+    )]
+    InvalidSegments(usize),
 }
 
 impl Config {
-    /// Mirror names must be unique: they identify state, locks and layout.
+    /// Every model-level check: `validate_mirrors` plus an absolute target.
+    /// Run on the final config, after env overrides.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let mut seen = std::collections::BTreeSet::new();
-        for m in &self.mirrors {
-            if !seen.insert(m.name.as_str()) {
-                return Err(ConfigError::DuplicateName(m.name.clone()));
-            }
+        if !self.global.target.is_absolute() {
+            return Err(ConfigError::InvalidTarget(self.global.target.clone()));
+        }
+        let segments = self.global.segments_per_file;
+        if !(1..=MAX_SEGMENTS_PER_FILE).contains(&segments) {
+            return Err(ConfigError::InvalidSegments(segments));
+        }
+        self.validate_mirrors()
+    }
+
+    /// Commands that act on mirrors refuse a config with none.
+    pub fn require_mirrors(&self) -> Result<(), ConfigError> {
+        if self.mirrors.is_empty() {
+            return Err(ConfigError::NoMirrors);
         }
         Ok(())
     }
+
+    /// Unique, printable names, http(s) URLs, and mirror paths that stay
+    /// inside the target without sharing or nesting. Target-independent, so
+    /// a source can check it before env overrides are applied.
+    pub fn validate_mirrors(&self) -> Result<(), ConfigError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut paths: Vec<(PathBuf, &str)> = Vec::with_capacity(self.mirrors.len());
+        for m in &self.mirrors {
+            if has_control_chars(&m.name) {
+                return Err(ConfigError::InvalidName(m.name.clone()));
+            }
+            check_apt_fields(m)?;
+            if !seen.insert(m.name.as_str()) {
+                return Err(ConfigError::DuplicateName(m.name.clone()));
+            }
+            if !matches!(m.url.scheme(), "http" | "https") {
+                return Err(ConfigError::UnsupportedScheme {
+                    mirror: m.name.clone(),
+                    url: m.url.to_string(),
+                });
+            }
+            let path =
+                normalize_mirror_path(&m.path).map_err(|reason| ConfigError::InvalidPath {
+                    mirror: m.name.clone(),
+                    path: m.path.clone(),
+                    reason,
+                })?;
+            paths.push((path, m.name.as_str()));
+        }
+        check_disjoint_paths(paths)
+    }
+}
+
+/// The one control-character rule (C0, DEL and C1, e.g. U+0085) for every
+/// value that becomes a directory or a log field.
+#[must_use]
+pub fn has_control_chars(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
+/// Suites, components and architectures become directory names.
+fn check_apt_fields(m: &MirrorConfig) -> Result<(), ConfigError> {
+    let BackendOptions::Apt(apt) = &m.backend_options;
+    let fields = [
+        ("suites", &apt.suites),
+        ("components", &apt.components),
+        ("architectures", &apt.architectures),
+    ];
+    for (field, values) in fields {
+        if let Some(value) = values.iter().find(|v| has_control_chars(v)) {
+            return Err(ConfigError::ControlChars {
+                mirror: m.name.clone(),
+                field,
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Lexically normalize a mirror path: drop `.` components and reject
+/// anything absolute, climbing with `..`, naming the target itself, or
+/// containing control characters (NUL truncates C paths; others garble logs).
+///
+/// # Errors
+///
+/// A short reason, as used by `ConfigError::InvalidPath`.
+pub fn normalize_mirror_path(path: &Path) -> Result<PathBuf, &'static str> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(part) if has_control_chars(&part.to_string_lossy()) => {
+                return Err("must not contain control characters");
+            }
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => return Err("must not contain `..`"),
+            Component::RootDir | Component::Prefix(_) => return Err("must be relative"),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err("must name a subdirectory, not the target itself");
+    }
+    Ok(out)
+}
+
+/// Reject duplicate or nested mirror directories. Sorting puts every
+/// ancestor before its descendants (component-wise order).
+fn check_disjoint_paths(mut paths: Vec<(PathBuf, &str)>) -> Result<(), ConfigError> {
+    paths.sort();
+    for (i, (path, name)) in paths.iter().enumerate() {
+        let Some((outer_path, outer)) = paths[..i].iter().find(|(p, _)| path.starts_with(p)) else {
+            continue;
+        };
+        return Err(if outer_path == path {
+            ConfigError::DuplicatePath {
+                first: (*outer).to_owned(),
+                second: (*name).to_owned(),
+                path: path.clone(),
+            }
+        } else {
+            ConfigError::NestedPath {
+                outer: (*outer).to_owned(),
+                outer_path: outer_path.clone(),
+                inner: (*name).to_owned(),
+                inner_path: path.clone(),
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Apt's rule: a suite ending in `/`, or a bare `.`, is a flat-repo path.
@@ -707,22 +876,22 @@ mod tests {
     }
 
     #[test]
-    fn i18n_only_langs_normalized_to_lowercase_on_build() {
-        let out = build_i18n(I18nSelection::Only(vec!["zh_CN".into(), "en_US".into()]));
+    fn i18n_only_langs_keep_configured_case() {
+        let out = build_i18n(I18nSelection::Only(vec!["zh_CN".into(), "pt_BR".into()]));
         assert_eq!(
             out,
-            I18nSelection::Only(vec!["zh_cn".into(), "en_us".into()])
+            I18nSelection::Only(vec!["zh_CN".into(), "pt_BR".into()])
         );
     }
 
     #[test]
-    fn i18n_only_duplicate_case_variants_collapse() {
+    fn i18n_only_duplicate_case_variants_collapse_to_first_spelling() {
         let out = build_i18n(I18nSelection::Only(vec![
-            "zh".into(),
-            "ZH".into(),
-            "Zh".into(),
+            "zh_CN".into(),
+            "zh_cn".into(),
+            "ZH_CN".into(),
         ]));
-        assert_eq!(out, I18nSelection::Only(vec!["zh".into()]));
+        assert_eq!(out, I18nSelection::Only(vec!["zh_CN".into()]));
     }
 
     #[test]
@@ -1065,6 +1234,221 @@ mod tests {
                 assert!(!apt.indexes.debian_installer);
                 assert!(apt.indexes.packages);
             }
+        }
+    }
+
+    fn cfg_with(target: &str, mirrors: &[(&str, &str, Option<&str>)]) -> Config {
+        let mirrors = mirrors
+            .iter()
+            .map(|(name, url, path)| {
+                let mut p = apt_only(partial_mirror(name, url), &["bookworm"], &["amd64"]);
+                p.overrides.path = path.map(PathBuf::from);
+                resolve_mirror(p, &MirrorDefaults::default()).unwrap()
+            })
+            .collect();
+        Config {
+            global: GlobalConfig {
+                target: PathBuf::from(target),
+                ..GlobalConfig::default()
+            },
+            mirrors,
+        }
+    }
+
+    const URL: &str = "https://example.com/";
+
+    #[test]
+    fn validate_accepts_disjoint_relative_paths() {
+        let cfg = cfg_with(
+            "/srv/mirrors",
+            &[
+                ("debian", URL, None),
+                ("pve", URL, Some("proxmox/pve")),
+                ("ceph", URL, Some("./proxmox/ceph")),
+                ("debian-security", "http://example.com/", None),
+            ],
+        );
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_bad_mirror_paths() {
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            ("abs", Some("/etc"), "must be relative"),
+            ("up", Some("../x"), "`..`"),
+            ("mid-up", Some("a/../../x"), "`..`"),
+            ("empty", Some(""), "subdirectory"),
+            ("dot", Some("."), "subdirectory"),
+            ("dot-slash", Some("./"), "subdirectory"),
+            ("nul", Some("a\0b"), "control characters"),
+            ("newline", Some("a/b\nc"), "control characters"),
+            ("c1", Some("a\u{85}b"), "control characters"),
+            // The name is the default path, so it obeys the same rules.
+            ("../../etc", None, "`..`"),
+            ("..", None, "`..`"),
+            (".", None, "subdirectory"),
+        ];
+        for (name, path, reason) in cases {
+            let err = cfg_with("/data", &[(name, URL, *path)])
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidPath { mirror, .. } if mirror == name),
+                "{name}/{path:?}: {err:?}"
+            );
+            assert!(err.to_string().contains(reason), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_shared_paths_after_normalization() {
+        for (a, b) in [
+            (None, Some("debian")),
+            (None, Some("./debian/")),
+            (Some("x/y"), Some("x/./y")),
+        ] {
+            let err = cfg_with("/data", &[("debian", URL, a), ("other", URL, b)])
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::DuplicatePath { .. }),
+                "{a:?}/{b:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_nested_paths_in_either_order() {
+        for mirrors in [
+            [
+                ("outer", URL, Some("debian")),
+                ("inner", URL, Some("debian/pve")),
+            ],
+            [
+                ("inner", URL, Some("debian/pve")),
+                ("outer", URL, Some("debian")),
+            ],
+        ] {
+            let err = cfg_with("/data", &mirrors).validate().unwrap_err();
+            match &err {
+                ConfigError::NestedPath { outer, inner, .. } => {
+                    assert_eq!((outer.as_str(), inner.as_str()), ("outer", "inner"));
+                }
+                other => panic!("expected NestedPath, got {other:?}"),
+            }
+        }
+        // A shared prefix that is not a path component is not nesting.
+        cfg_with(
+            "/data",
+            &[
+                ("a", URL, Some("debian")),
+                ("b", URL, Some("debian-security")),
+            ],
+        )
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_relative_target() {
+        for target in ["", "data", "./data"] {
+            let err = cfg_with(target, &[]).validate().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidTarget(_)),
+                "{target}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_segments_per_file_out_of_range() {
+        for segments in [0, MAX_SEGMENTS_PER_FILE + 1, 64] {
+            let mut cfg = cfg_with("/data", &[]);
+            cfg.global.segments_per_file = segments;
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidSegments(n) if n == segments),
+                "{segments}: {err:?}"
+            );
+        }
+        for segments in [1, MAX_SEGMENTS_PER_FILE] {
+            let mut cfg = cfg_with("/data", &[]);
+            cfg.global.segments_per_file = segments;
+            cfg.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_names() {
+        for name in ["a\0b", "deb\nian", "x\u{7f}", "c1\u{85}"] {
+            let err = cfg_with("/data", &[(name, URL, Some("ok"))])
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidName(n) if n == name),
+                "{name:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_control_characters_in_apt_fields() {
+        for (field, value) in [
+            ("suites", "book\u{85}worm"),
+            ("components", "main\u{7f}"),
+            ("architectures", "amd\n64"),
+        ] {
+            let mut cfg = cfg_with("/data", &[("d", URL, None)]);
+            let BackendOptions::Apt(apt) = &mut cfg.mirrors[0].backend_options;
+            let target = match field {
+                "suites" => &mut apt.suites,
+                "components" => &mut apt.components,
+                _ => &mut apt.architectures,
+            };
+            *target = vec![value.to_owned()];
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::ControlChars { field: f, value: v, .. }
+                    if *f == field && v == value),
+                "{field}: {err:?}"
+            );
+            // Escaped in the message.
+            assert!(!has_control_chars(&err.to_string()), "{err}");
+        }
+    }
+
+    #[test]
+    fn path_errors_escape_control_characters() {
+        let err = cfg_with("/data", &[("d", URL, Some("a\nb"))])
+            .validate()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(r#""a\nb""#), "{msg}");
+    }
+
+    #[test]
+    fn validate_mirrors_ignores_target_and_require_mirrors_needs_one() {
+        let empty = cfg_with("relative", &[]);
+        empty.validate_mirrors().unwrap();
+        assert!(matches!(
+            empty.require_mirrors(),
+            Err(ConfigError::NoMirrors)
+        ));
+        cfg_with("/data", &[("d", URL, None)])
+            .require_mirrors()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_non_http_url() {
+        for url in ["ftp://example.com/debian", "file:///srv/debian"] {
+            let err = cfg_with("/data", &[("d", url, None)])
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::UnsupportedScheme { mirror, .. } if mirror == "d"),
+                "{url}: {err:?}"
+            );
         }
     }
 

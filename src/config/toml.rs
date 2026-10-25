@@ -37,7 +37,8 @@ pub fn parse(text: &str) -> Result<Config, TomlError> {
     }
 
     let cfg = Config { global, mirrors };
-    cfg.validate().map_err(TomlError::Model)?;
+    // `target` is checked by `load`, after `TAIN_TARGET` may override it.
+    cfg.validate_mirrors().map_err(TomlError::Model)?;
     Ok(cfg)
 }
 

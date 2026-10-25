@@ -9,6 +9,7 @@ pub mod env;
 pub mod load;
 pub mod mirrors_list;
 pub mod model;
+pub mod schedule;
 pub mod toml;
 
 pub use model::*;

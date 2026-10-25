@@ -1,4 +1,4 @@
-//! Acceptance tests for the documented config example and `mirrors.list`
+//! Acceptance tests for the documented config example and apt-mirror's `mirror.list`
 //! importer syntax. Fixtures mirror the docs: fix code or docs, not fixtures.
 
 use std::collections::HashMap;
@@ -103,12 +103,12 @@ fn config_example_toml_check_output_round_trips() {
     assert_eq!(display::format_config(&reparsed), out);
 }
 
-// ---------- sample apt-mirror `mirrors.list` entries ----------
+// ---------- sample apt-mirror `mirror.list` entries ----------
 
 #[test]
 fn sample_mirrors_list_parses_end_to_end() {
     let entries = mirrors_list::parse(SAMPLE_MIRRORS_LIST)
-        .expect("every sample mirrors.list syntax must still parse");
+        .expect("every sample mirror.list syntax must still parse");
     let debs = entries
         .iter()
         .filter(|e| matches!(e, mirrors_list::Entry::Deb(_)))

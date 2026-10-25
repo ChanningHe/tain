@@ -119,6 +119,29 @@ pub fn detect_legacy(env: &dyn EnvSource) -> Vec<LegacyWarning> {
         .collect()
 }
 
+/// Variables read only in single-mirror mode (no TOML file).
+pub const SINGLE_SOURCE_ENV_NAMES: &[&str] = &[
+    "TAIN_URL",
+    "TAIN_DISTS",
+    "TAIN_PATH",
+    "TAIN_INDEXES",
+    "TAIN_VERIFY_PGP",
+    "TAIN_KEYRING",
+    "TAIN_GC",
+    "TAIN_GC_GRACE",
+    "TAIN_GC_MAX_DELETE_RATIO",
+    "TAIN_GC_KEEP_GENERATIONS",
+];
+
+/// Single-mirror variables set to a non-empty value; ignored in TOML mode.
+pub fn single_source_vars_set(env: &dyn EnvSource) -> Vec<&'static str> {
+    SINGLE_SOURCE_ENV_NAMES
+        .iter()
+        .copied()
+        .filter(|name| env.get(name).is_some_and(|v| !v.is_empty()))
+        .collect()
+}
+
 // ---------- `TAIN_DISTS` parser ----------
 
 /// One `suites|components|architectures[|path]` group from `TAIN_DISTS`.
@@ -1060,6 +1083,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn single_source_vars_set_lists_non_empty_mirror_vars_only() {
+        let e = env(&[
+            ("TAIN_URL", "http://x"),
+            ("TAIN_GC", "1"),
+            ("TAIN_PATH", ""),
+            ("TAIN_PARALLEL", "4"), // global override, honored in TOML mode
+        ]);
+        assert_eq!(single_source_vars_set(&e), vec!["TAIN_URL", "TAIN_GC"]);
     }
 
     #[test]
