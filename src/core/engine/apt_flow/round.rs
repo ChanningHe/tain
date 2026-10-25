@@ -25,7 +25,7 @@ use crate::core::types::{DigestAlgo, FileSpec};
 use super::derive_pool::{parse_installer_sums_into, parse_packages_into, parse_sources_into};
 use super::hex::{hex_of, hex_of_digest_algo};
 use super::pool_download::{download_pool_file, is_already_present};
-use super::pool_fence::{PoolFence, symlinked_dists};
+use super::pool_fence::PoolFence;
 use super::root_fetch::{MAX_RELEASE_BYTES, MAX_SIGNATURE_BYTES, RootFetcher};
 use super::root_files::{PublishedRoot, VerbatimKind, change_token, vet_siblings};
 use super::stage::{StageMode, StagedIndex, pick_parseable_variant, stage_indexes_with_mode};
@@ -377,7 +377,7 @@ impl SuiteRun<'_> {
     }
 
     /// Refuse pool specs that would overwrite root files, indexes, by-hash
-    /// objects or another configured suite's tree.
+    /// objects, or land under `dists/` outside this suite's own tree.
     fn fence_pool(
         &self,
         checksums: &ReleaseChecksums,
@@ -395,7 +395,6 @@ impl SuiteRun<'_> {
             own: &own,
             others: &others,
             checksums,
-            symlinked: &symlinked_dists(self.mirror_root),
         }
         .check(pool_specs)
     }

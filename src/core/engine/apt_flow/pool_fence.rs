@@ -1,11 +1,14 @@
-//! Pool specs come from untrusted indexes. One whose path is a root file, a
-//! by-hash object, lies in another configured suite's tree, or is a
-//! Release-listed file with different bytes would overwrite verified
-//! metadata (staged or published), so the suite fails instead. Other files
-//! under the suite's own directory (Proxmox / Tailscale style pools) stay
-//! legal, as does a Release-listed file vouched for with the same bytes
-//! (debian-installer's `SHA256SUMS` lists `MD5SUMS`, which Release lists
-//! too).
+//! Pool specs come from untrusted indexes. Below the suite's own directory
+//! they are staged; anywhere else they are written straight into the
+//! published tree. A spec fails the suite when its path is a root file, a
+//! by-hash object, a Release-listed file whose bytes cannot be shown to
+//! match, another configured suite's directory, or anything under `dists/`
+//! (including `dists` itself) that is not below this suite's own directory:
+//! a suite alias symlink, a directory a later alias or suite would need, or
+//! the suite directory itself. Other files under the suite's own directory
+//! (Proxmox / Tailscale style pools) stay legal, as does a Release-listed
+//! file vouched for with the same bytes (debian-installer's `SHA256SUMS`
+//! lists `MD5SUMS`, which Release lists too).
 
 use crate::backends::apt::checksums::{ChecksumEntry, ReleaseChecksums};
 use crate::core::types::{DigestAlgo, FileSpec};
@@ -13,6 +16,7 @@ use crate::core::types::{DigestAlgo, FileSpec};
 use super::AptFlowError;
 
 const ROOT_FILES: [&str; 3] = ["InRelease", "Release", "Release.gpg"];
+const DISTS: &str = "dists/";
 
 /// Where one suite's pool specs may not land.
 pub(super) struct PoolFence<'a> {
@@ -22,10 +26,6 @@ pub(super) struct PoolFence<'a> {
     pub(super) others: &'a [String],
     /// This suite's Release entries (relative to `own`).
     pub(super) checksums: &'a ReleaseChecksums,
-    /// `dists/<name>/` entries that are symlinks on disk (suite aliases such
-    /// as `stable -> bookworm`): writing below one lands in its target's
-    /// published tree.
-    pub(super) symlinked: &'a [String],
 }
 
 impl PoolFence<'_> {
@@ -48,24 +48,32 @@ impl PoolFence<'_> {
         if is_by_hash(rel, self.own) {
             return Some("a by-hash object");
         }
-        if self
-            .symlinked
-            .iter()
-            .any(|p| p != self.own && rel.starts_with(p.as_str()))
-        {
-            return Some("a suite alias symlink's target");
+        if let Some(reason) = self.release_listed_conflict(spec) {
+            return Some(reason);
         }
-        if rel
-            .strip_prefix(self.own)
-            .and_then(|suffix| self.checksums.get(suffix))
-            .is_some_and(|entry| !same_bytes(spec, entry))
-        {
-            return Some("a file listed in Release with different content");
-        }
-        if self.in_other_suite(rel) {
+        // Also covers a suite configured below this one's directory.
+        if self.others.iter().any(|p| is_at_or_below(rel, p)) {
             return Some("another configured suite's directory");
         }
+        if is_at_or_below(rel, DISTS) && !rel.starts_with(self.own) {
+            return Some("a path under dists/ outside this suite's directory");
+        }
         None
+    }
+
+    /// A path Release names may only carry the bytes Release vouches for;
+    /// an entry the weak-hash policy dropped vouches for nothing.
+    fn release_listed_conflict(&self, spec: &FileSpec) -> Option<&'static str> {
+        let suffix = spec.rel_path.as_str().strip_prefix(self.own)?;
+        match self.checksums.get(suffix) {
+            Some(entry) if !same_bytes(spec, entry) => {
+                Some("a file listed in Release with different content")
+            }
+            None if self.checksums.is_listed(suffix) => {
+                Some("a file listed in Release with weak digests only")
+            }
+            _ => None,
+        }
     }
 
     /// `InRelease` / `Release` / `Release.gpg` of this or any configured
@@ -80,21 +88,13 @@ impl PoolFence<'_> {
         let is_suite_dir = |p: &str| p == dir_slash || (p.is_empty() && dir.is_empty());
         is_suite_dir(self.own)
             || self.others.iter().any(|p| is_suite_dir(p))
-            || (dir.starts_with("dists/") && dir.matches('/').count() == 1)
+            || (dir.starts_with(DISTS) && dir.matches('/').count() == 1)
     }
+}
 
-    /// The longest matching suite directory owns a path, so suite `a/b`
-    /// may use `dists/a/b/...` although suite `a` is configured too.
-    fn in_other_suite(&self, rel: &str) -> bool {
-        let own = rel.starts_with(self.own).then_some(self.own.len());
-        let other = self
-            .others
-            .iter()
-            .filter(|p| rel.starts_with(p.as_str()))
-            .map(String::len)
-            .max();
-        other > own
-    }
+/// `rel` is the directory `dir` (given with a trailing slash) or below it.
+fn is_at_or_below(rel: &str, dir: &str) -> bool {
+    rel.starts_with(dir) || Some(rel) == dir.strip_suffix('/')
 }
 
 /// Both sources vouch for the same bytes: equal SHA-256 (required on both
@@ -107,20 +107,8 @@ fn same_bytes(spec: &FileSpec, entry: &ChecksumEntry) -> bool {
     same_hash && spec.size.is_none_or(|size| size == entry.size)
 }
 
-/// `dists/<name>/` for every symlink directly under `<mirror_root>/dists`.
-pub(super) fn symlinked_dists(mirror_root: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(mirror_root.join("dists")) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
-        .filter_map(|e| e.file_name().to_str().map(|n| format!("dists/{n}/")))
-        .collect()
-}
-
 fn is_by_hash(rel: &str, own: &str) -> bool {
-    (rel.starts_with("dists/") || rel.starts_with(own)) && rel.split('/').any(|s| s == "by-hash")
+    (rel.starts_with(DISTS) || rel.starts_with(own)) && rel.split('/').any(|s| s == "by-hash")
 }
 
 #[cfg(test)]
@@ -163,16 +151,12 @@ mod tests {
     }
 
     fn check(rel: &str) -> Result<(), AptFlowError> {
-        let others = vec![
-            "dists/trixie/".to_owned(),
-            "dists/bookworm/updates/".to_owned(),
-        ];
+        let others = vec!["dists/trixie/".to_owned()];
         let c = checksums();
         PoolFence {
             own: "dists/bookworm/",
             others: &others,
             checksums: &c,
-            symlinked: &[],
         }
         .check(&[spec(rel)])
     }
@@ -192,7 +176,6 @@ mod tests {
             "dists/bookworm/Release.gpg",
             "dists/trixie/InRelease",
             "dists/stable/Release",
-            "dists/bookworm/updates/Release.gpg",
         ] {
             assert_eq!(reason(rel), "a suite root file", "{rel}");
         }
@@ -207,6 +190,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_release_paths_listed_with_weak_digests_only() {
+        let mut c = checksums();
+        c.upsert(
+            DigestAlgo::Md5,
+            "d41d8cd98f00b204e9800998ecf8427e",
+            0,
+            "main/binary-amd64/Packages.bz2",
+        )
+        .unwrap();
+        let (c, _) = c.apply_weak_hash_policy(false);
+        let fence = PoolFence {
+            own: "dists/bookworm/",
+            others: &[],
+            checksums: &c,
+        };
+        let err = fence
+            .check(&[spec("dists/bookworm/main/binary-amd64/Packages.bz2")])
+            .unwrap_err();
+        assert!(
+            matches!(err, AptFlowError::PoolPathConflict { reason, .. }
+                if reason == "a file listed in Release with weak digests only"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn accepts_release_listed_file_with_same_content() {
         let mut same = spec("dists/bookworm/main/binary-amd64/Packages.xz");
         same.digests = crate::core::types::DigestSet::new();
@@ -217,13 +226,11 @@ mod tests {
         same.digests
             .push(crate::core::types::Digest::new(DigestAlgo::Sha256, empty).unwrap())
             .unwrap();
-        let others = Vec::new();
         let c = checksums();
         let fence = PoolFence {
             own: "dists/bookworm/",
-            others: &others,
+            others: &[],
             checksums: &c,
-            symlinked: &[],
         };
         assert!(fence.check(std::slice::from_ref(&same)).is_ok());
         // Same hash but a different stated size is still a conflict.
@@ -232,37 +239,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_paths_below_a_symlinked_alias_but_not_own_dir() {
-        let others = Vec::new();
-        let c = checksums();
-        let symlinked = vec!["dists/stable/".to_owned(), "dists/bookworm/".to_owned()];
-        let fence = PoolFence {
-            own: "dists/bookworm/",
-            others: &others,
-            checksums: &c,
-            symlinked: &symlinked,
-        };
-        let err = fence
-            .check(&[spec("dists/stable/main/binary-amd64/x.deb")])
-            .unwrap_err();
-        assert!(
-            matches!(err, AptFlowError::PoolPathConflict { reason, .. }
-                if reason == "a suite alias symlink's target"),
-            "{err:?}"
-        );
-        // In-suite files are staged, never written through the own path.
-        assert!(fence.check(&[spec("dists/bookworm/main/x.deb")]).is_ok());
-    }
-
-    #[test]
-    fn symlinked_dists_lists_only_symlinks() {
-        let root = std::env::temp_dir().join(format!("tain-fence-ln-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("dists/bookworm")).unwrap();
-        std::os::unix::fs::symlink("bookworm", root.join("dists/stable")).unwrap();
-        assert_eq!(symlinked_dists(&root), vec!["dists/stable/".to_owned()]);
-        assert!(symlinked_dists(&root.join("missing")).is_empty());
-        std::fs::remove_dir_all(&root).unwrap();
+    fn rejects_dists_paths_outside_own_directory() {
+        for rel in [
+            "dists",
+            "dists/bookworm",
+            "dists/stable",
+            "dists/stable/main/binary-amd64/x.deb",
+            "dists/stable/InRelease.deb",
+            "dists/bookworm-security/x.deb",
+            "dists/x.deb",
+        ] {
+            assert_eq!(
+                reason(rel),
+                "a path under dists/ outside this suite's directory",
+                "{rel}"
+            );
+        }
     }
 
     #[test]
@@ -277,12 +269,25 @@ mod tests {
 
     #[test]
     fn rejects_other_suites_trees() {
-        for rel in [
-            "dists/trixie/main/binary-amd64/x.deb",
-            "dists/bookworm/updates/main/x.deb",
-        ] {
+        for rel in ["dists/trixie/main/binary-amd64/x.deb", "dists/trixie"] {
             assert_eq!(reason(rel), "another configured suite's directory", "{rel}");
         }
+    }
+
+    #[test]
+    fn rejects_a_suite_configured_below_own_directory() {
+        let others = vec!["dists/bookworm/updates/".to_owned()];
+        let c = checksums();
+        let fence = PoolFence {
+            own: "dists/bookworm/",
+            others: &others,
+            checksums: &c,
+        };
+        assert!(
+            fence
+                .check(&[spec("dists/bookworm/updates/main/x.deb")])
+                .is_err()
+        );
     }
 
     #[test]
@@ -291,29 +296,10 @@ mod tests {
             "pool/main/n/nginx/nginx_1.0_amd64.deb",
             "dists/bookworm/pve-no-subscription/binary-amd64/pve_1.0_amd64.deb",
             "dists/bookworm/main/binary-amd64/Packages.gz.deb",
-            "dists/bookworm-security/x.deb",
             // `Release` deeper than a suite dir and not listed: not a root file.
             "dists/bookworm/main/installer-amd64/current/images/Release",
         ] {
             assert!(check(rel).is_ok(), "{rel}");
         }
-    }
-
-    #[test]
-    fn nested_suite_owns_its_own_tree() {
-        let others = vec!["dists/bookworm/".to_owned()];
-        let c = checksums();
-        let fence = PoolFence {
-            own: "dists/bookworm/updates/",
-            others: &others,
-            checksums: &c,
-            symlinked: &[],
-        };
-        assert!(
-            fence
-                .check(&[spec("dists/bookworm/updates/main/x.deb")])
-                .is_ok()
-        );
-        assert!(fence.check(&[spec("dists/bookworm/main/x.deb")]).is_err());
     }
 }

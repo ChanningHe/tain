@@ -1,6 +1,6 @@
 //! Release checksum blocks, folded per path across algorithms, plus the weak-hash policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::core::types::{Digest, DigestAlgo, DigestError, DigestSet, DuplicateDigest};
 
@@ -17,12 +17,22 @@ pub struct ChecksumEntry {
 pub struct ReleaseChecksums {
     entries: Vec<ChecksumEntry>,
     index: BTreeMap<String, usize>,
+    /// Paths the weak-hash policy removed from `entries`; Release still
+    /// names them, so nothing else may claim those paths.
+    weak_dropped: BTreeSet<String>,
 }
 
 impl ReleaseChecksums {
     #[must_use]
     pub fn get(&self, path: &str) -> Option<&ChecksumEntry> {
         self.index.get(path).map(|&i| &self.entries[i])
+    }
+
+    /// Whether Release names `path`, including entries the weak-hash policy
+    /// dropped.
+    #[must_use]
+    pub fn is_listed(&self, path: &str) -> bool {
+        self.index.contains_key(path) || self.weak_dropped.contains(path)
     }
 
     #[must_use]
@@ -120,7 +130,8 @@ impl ReleaseChecksums {
             if is_weak {
                 weak_only.push(self.entries[i].path.clone());
                 if !allow_weak_hash {
-                    self.entries.swap_remove(i);
+                    let dropped = self.entries.swap_remove(i);
+                    self.weak_dropped.insert(dropped.path);
                 }
             }
         }
@@ -323,6 +334,18 @@ mod tests {
         assert!(filtered.get("strong").is_some());
         assert_eq!(report.weak_only_paths, vec!["weak".to_owned()]);
         assert!(report.policy_dropped);
+    }
+
+    #[test]
+    fn dropped_weak_only_paths_stay_listed() {
+        let mut c = ReleaseChecksums::default();
+        c.upsert(DigestAlgo::Md5, &h(32), 100, "weak").unwrap();
+        c.upsert(DigestAlgo::Sha256, &h(64), 100, "strong").unwrap();
+        let (filtered, _) = c.apply_weak_hash_policy(false);
+        assert!(filtered.get("weak").is_none());
+        assert!(filtered.is_listed("weak"));
+        assert!(filtered.is_listed("strong"));
+        assert!(!filtered.is_listed("absent"));
     }
 
     #[test]

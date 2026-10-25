@@ -465,12 +465,16 @@ would leave the mirror directory or point into `.tain/` are refused. So are
 paths that would overwrite verified metadata: any
 `dists/<name>/InRelease`, `Release` or `Release.gpg`, a file listed in
 the suite's `Release` unless both list the same SHA-256 (and size, when
-given), as for the installer's `MD5SUMS`, any `by-hash` object
-under `dists/`, a path below a suite alias symlink such as
-`dists/stable`, or a file in
-another configured suite's directory. Such an entry fails the suite
+given), as for the installer's `MD5SUMS`, a path `Release` lists with only
+MD5 or SHA-1 checksums, any `by-hash` object under `dists/`, and any other
+path under `dists/` outside the suite's own directory (another suite's
+directory, a suite alias such as `dists/stable`, or the suite directory
+itself). Such an entry fails the suite
 (`PoolPathConflict`, also reported by `--dry-run`); other files under the
 suite's own directory, as some third-party repositories use, still sync.
+Configure such repositories by codename (`trixie`), not by an alias
+(`stable`): their package paths point into `dists/<codename>/`, which is
+outside an alias suite's directory.
 
 ### Network
 
