@@ -1,0 +1,15 @@
+# cargo-audit configuration. Every ignore must say why it does not apply.
+
+[advisories]
+ignore = [
+    # rsa 0.9 (via pgp): Marvin timing attack recovers an RSA *private* key
+    # from decryption/signing timings. tain only verifies signatures against
+    # public keys from the operator's keyring; it holds no secret key material.
+    # No fixed rsa release exists, and pgp 0.21 still depends on rsa 0.9.
+    "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 (via pgp -> elliptic-curve 0.13): timing variability in
+    # operations meant to be constant-time. Only matters when the operands are
+    # secret; signature verification works on public keys and public
+    # signatures. The fix (0.7) is unreachable while pgp pins elliptic-curve 0.13.
+    "RUSTSEC-2026-0387",
+]

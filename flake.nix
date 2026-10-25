@@ -42,6 +42,7 @@
         };
 
         commonPackages = with pkgs; [
+          cargo-audit
           cargo-llvm-cov
           cargo-nextest
           cargo-zigbuild

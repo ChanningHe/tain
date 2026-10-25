@@ -32,26 +32,36 @@ bytesize = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env", "wrap_help"] }
 croner = "3"
+# Retry jitter only (non-cryptographic).
+fastrand = "2"
 flate2 = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 humantime = "2"
 humantime-serde = "1"
 md-5 = "0.10"
 pgp = { version = "0.20", optional = true, default-features = false }
+# TLS trust: the system store (honours SSL_CERT_FILE / SSL_CERT_DIR, so a
+# private CA added to ca-certificates works) plus the bundled webpki roots as
+# a fallback for hosts without a CA bundle. Both sets are trusted.
 reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
+  "rustls-tls-native-roots",
+  "rustls-tls-webpki-roots",
   "http2",
   "stream",
   "charset",
 ] }
 libc = "0.2"
+# Only to recognise certificate errors by type. Default features pull in
+# aws-lc-rs (C); the ring provider comes from reqwest.
+rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
-time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "test-util", "signal"] }
+# >= 0.3.47: RUSTSEC-2026-0009 (stack exhaustion parsing RFC 2822 dates).
+time = { version = "0.3.47", features = ["parsing", "formatting", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 toml = "0.9"
 tracing = "0.1"
 url = { version = "2", features = ["serde"] }
@@ -67,8 +77,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
-fastrand = "2"
-libc = "0.2"
+# Paused-clock tests (`start_paused`); kept out of the shipped binary.
+tokio = { version = "1", features = ["test-util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 
 [profile.release]
