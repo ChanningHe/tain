@@ -10,6 +10,41 @@ on:
 permissions:
   contents: read
 
+# Publishing order: draft GitHub Release with all assets -> images -> un-draft.
+# A failure leaves at most a draft release (and possibly pushed images);
+# recover with "Re-run failed jobs". "Re-run all jobs" also works: the gate
+# accepts an existing draft and the draft job re-uploads its assets; it also
+# rebuilds and re-pushes the images, so their tags move to a new digest
+# (same content).
+#
+# Moving tags (image latest / X / X.Y, GitHub "Latest") are decided by
+# .github/scripts/moving-tags.sh right before each use (docker, publish),
+# from the published stable releases plus this version, not from run order:
+# only the highest takes latest and X, only the highest within X.Y takes
+# X.Y. Backports and re-runs after a newer release is published cannot
+# steal them. Until the newer version's GitHub Release is published, an
+# older tag's run may still take the moving tags (image latest / X / X.Y and
+# GitHub "Latest"; the release and debug matrix legs may even disagree).
+# Once the newer release is published, re-run its docker job to correct
+# them.
+#
+# The gate's cargo audit uses the live advisory database: a newly published
+# advisory blocks a release until it is fixed or justified in
+# .cargo/audit.toml.
+#
+# One run per event and ref (GitHub keeps only one pending run per group, so
+# a shared group would drop queued tags). Never cancel a run that may be
+# half-published.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Explicit bash = `bash -eo pipefail`: a failing command inside a pipeline
+# fails the step (the implicit default shell has no pipefail).
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,6 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
 
@@ -30,7 +66,39 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
             exit 1
           fi
+          # Build metadata (1.2.3+x) has no ordering and no image tag form.
+          case "$VERSION" in
+            *+*)
+              echo "::error::version $VERSION has build metadata (+); not supported for releases"
+              exit 1 ;;
+          esac
+          # X.Y.Z without leading zeros, optionally -prerelease.
+          if ! printf '%s\n' "${VERSION%%-*}" \
+              | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::version $VERSION is not X.Y.Z[-prerelease]"
+            exit 1
+          fi
+          # SemVer pre-release (1.2.0-rc.1): GitHub prerelease, no moving tags.
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *) PRERELEASE=false ;;
+          esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      # A re-pushed tag must not silently overwrite published artifacts.
+      # An existing draft (visible to this token or not) passes the guard.
+      - name: Refuse to overwrite a published release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          STATE="$(sh .github/scripts/release-state.sh "$GITHUB_REF_NAME")"
+          if [ "$STATE" = published ]; then
+            echo "::error::release $GITHUB_REF_NAME is already published; bump the version instead"
+            exit 1
+          fi
 
       - uses: DeterminateSystems/nix-installer-action@v23
       - name: cargo fmt --check
@@ -43,6 +111,9 @@ jobs:
         run: nix develop --command cargo test --locked
       - name: cargo test (no default features)
         run: nix develop --command cargo test --locked --no-default-features
+      # Exceptions live in .cargo/audit.toml.
+      - name: cargo audit
+        run: nix develop --command cargo audit
 
   # Static musl binaries from the same nix devshell as gate; zig cross-links arm64.
   # Runs in parallel with gate; nothing is published unless gate passes.
@@ -80,6 +151,36 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist-out/${{ matrix.asset }}.tar.gz*
 
+  # Run the shipped tarballs on their own architecture, the way a user would:
+  # checksum, unpack, execute.
+  smoke:
+    name: smoke ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    needs: binaries
+    strategy:
+      matrix:
+        include:
+          - asset: tain-linux-amd64
+            runner: ubuntu-24.04
+          - asset: tain-linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.asset }}
+      - name: Verify, unpack and run
+        env:
+          ASSET: ${{ matrix.asset }}
+          TAIN_URL: http://deb.example.invalid/debian
+          TAIN_DISTS: "bookworm|main|amd64"
+        run: |
+          sha256sum -c "$ASSET.tar.gz.sha256"
+          tar xzf "$ASSET.tar.gz"
+          file "$ASSET/tain" | tee /dev/stderr | grep -qE 'static(ally|-pie) linked'
+          "./$ASSET/tain" --version
+          # Env-only config; check makes no network requests.
+          "./$ASSET/tain" check
+
   # Packages the exact binary from the amd64 tarball instead of rebuilding.
   deb:
     name: build .deb
@@ -106,10 +207,62 @@ jobs:
           name: tain-deb
           path: target/x86_64-unknown-linux-musl/debian/*.deb
 
+  # Tag pushes only: create (or, on a re-run, refresh) a DRAFT release holding
+  # every asset, so nothing user-visible exists before all artifacts do.
+  release-draft:
+    name: draft GitHub Release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: [gate, binaries, smoke, deb]
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+    steps:
+      # Optional hand-written notes (known issues, upgrade steps) for this tag,
+      # placed above the generated changelog.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/release-notes
+            .github/scripts
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist-out
+      - name: Create or update draft
+        run: |
+          NOTES=".github/release-notes/$TAG.md"
+          if [ -f "$NOTES" ]; then cp "$NOTES" notes-header.md; else : > notes-header.md; fi
+          set -- dist-out/tain-linux-amd64/tain-linux-amd64.tar.gz* \
+                 dist-out/tain-linux-arm64/tain-linux-arm64.tar.gz* \
+                 dist-out/tain-deb/*.deb
+          for f in "$@"; do [ -f "$f" ] || { echo "::error::missing asset $f"; exit 1; }; done
+          # Fail closed: create only when no release exists, refresh only a
+          # draft from an earlier attempt; anything else (published, API
+          # error, duplicate drafts) stops here.
+          STATE="$(sh .github/scripts/release-state.sh "$TAG")"
+          case "$STATE" in
+            none)
+              gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+                --notes-file notes-header.md --generate-notes \
+                --prerelease="$PRERELEASE" "$@" ;;
+            draft)
+              gh release upload "$TAG" --clobber "$@" ;;
+            *)
+              echo "::error::release $TAG is $STATE; refusing to change it"
+              exit 1 ;;
+          esac
+
+  # Pushes only once every other artifact exists, the binaries ran and (on a
+  # tag) the draft release holds them. Dry runs skip release-draft.
   docker:
     name: docker image (${{ matrix.variant }})
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
-    needs: [gate, binaries]
+    needs: [gate, binaries, smoke, deb, release-draft]
     strategy:
       matrix:
         # debug = same image plus busybox, tagged *-debug.
@@ -134,16 +287,40 @@ jobs:
       # COPY-only Dockerfile: no RUN, so no QEMU is needed for arm64.
       - uses: docker/setup-buildx-action@v4
 
+      # Recomputed here, not taken from the gate: a re-run after a newer
+      # release must not take latest back.
+      - name: Decide moving tags
+        id: moving
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          OUT="$(sh .github/scripts/moving-tags.sh "$VERSION")"
+          echo "$OUT"
+          echo "$OUT" >> "$GITHUB_OUTPUT"
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v6
+        env:
+          # GHCR reads the description from the multi-arch index.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ghcr.io/${{ github.repository }}
-          flavor: suffix=${{ matrix.variant == 'debug' && '-debug' || '' }},onlatest=true
+          # The exact version always; latest / X.Y / X only when this is the
+          # highest published stable version in that range.
+          flavor: |
+            latest=${{ steps.moving.outputs.latest }}
+            suffix=${{ matrix.variant == 'debug' && '-debug' || '' }},onlatest=true
           tags: |
             type=semver,pattern={{version}},value=${{ needs.gate.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.gate.outputs.version }}
-            type=semver,pattern={{major}},value=${{ needs.gate.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.gate.outputs.version }},enable=${{ steps.moving.outputs.minor }}
+            type=semver,pattern={{major}},value=${{ needs.gate.outputs.version }},enable=${{ steps.moving.outputs.major }}
+          labels: |
+            org.opencontainers.image.description=APT repository mirror sync (tain)
+          annotations: |
+            org.opencontainers.image.description=APT repository mirror sync (tain)
 
       - name: Login to GHCR
         if: github.event_name == 'push'
@@ -163,23 +340,37 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
 
+  # Last step: make the draft public once the images are pushed.
   publish:
     name: publish GitHub Release
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    needs: [binaries, deb, docker]
+    needs: [gate, release-draft, docker]
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+      VERSION: ${{ needs.gate.outputs.version }}
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7
         with:
-          path: dist-out
-      - uses: softprops/action-gh-release@v3
-        with:
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          files: |
-            dist-out/tain-linux-amd64/tain-linux-amd64.tar.gz*
-            dist-out/tain-linux-arm64/tain-linux-arm64.tar.gz*
-            dist-out/tain-deb/*.deb
+          sparse-checkout: .github/scripts
+      - name: Un-draft
+        run: |
+          # GitHub "Latest" only for the highest published stable version,
+          # decided now rather than in the gate (re-runs, backports).
+          MOVING="$(sh .github/scripts/moving-tags.sh "$VERSION")"
+          echo "$MOVING"
+          LATEST="$(printf '%s\n' "$MOVING" | sed -n 's/^latest=//p')"
+          case "$LATEST" in
+            true|false) ;;
+            *) echo "::error::moving-tags.sh gave no latest decision"; exit 1 ;;
+          esac
+          gh release edit "$TAG" --draft=false \
+            --prerelease="$PRERELEASE" --latest="$LATEST"
+

@@ -61,4 +61,5 @@ COPY --from=build /tain /usr/local/bin/tain
 COPY --from=build --chown=65532:65532 /data /data
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/tain"]
-CMD ["daemon", "--config", "/etc/tain/config.toml"]
+# Config: TAIN_CONFIG, else /etc/tain/config.toml, else TAIN_URL/TAIN_DISTS.
+CMD ["daemon"]

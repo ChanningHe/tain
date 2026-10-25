@@ -3,21 +3,20 @@ set -eu
 
 case "$1" in
     purge)
-        # Debian policy §6.5/§11.7: purge removes what postinst created.
-        rm -rf /etc/tain
-        if getent passwd tain >/dev/null 2>&1; then
-            deluser --system tain 2>/dev/null || userdel tain 2>/dev/null || true
-        fi
-        if getent group tain >/dev/null 2>&1; then
-            delgroup --system tain 2>/dev/null || groupdel tain 2>/dev/null || true
-        fi
-        # /srv/mirrors is mirror data and is kept on purge.
+        # Debian Policy §10.7.3: configuration files created by postinst are
+        # removed on purge. Anything else an operator put in /etc/tain stays.
+        rm -f /etc/tain/config.toml
+        rmdir /etc/tain 2>/dev/null || true
+        # The tain user and group are kept on purge, like /srv/mirrors: the
+        # mirror data is owned by them, and deleting the account would let a
+        # later account reuse the UID/GID and own (or modify) that data.
+        # See https://wiki.debian.org/AccountHandlingInMaintainerScripts.
         ;;
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         ;;
 esac
 
-if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
+if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 fi
 

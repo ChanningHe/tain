@@ -95,7 +95,7 @@ Tain is a general-purpose repository mirror sync framework written in
 Rust. APT is the supported backend. See README.md for the operator
 playbook.
 """
-depends = "ca-certificates, tzdata, adduser"
+depends = "ca-certificates, tzdata, adduser, procps"
 section = "utils"
 priority = "optional"
 assets = [

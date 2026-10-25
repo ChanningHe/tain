@@ -37,8 +37,21 @@ EOF
     chmod 0640 /etc/tain/config.toml
 fi
 
-if [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; then
+if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
+    # Upgrade: a running daemon keeps the old binary until restarted. On
+    # SIGTERM it lets an in-flight sync finish for up to TimeoutStopSec
+    # (5 min), then is killed; an interrupted sync is safe and resumes next
+    # run. Don't block dpkg on that wait.
+    # Oneshot units (tain-sync, tain@) use the new binary on their next run.
+    if [ "${1:-}" = configure ] && [ -n "${2:-}" ]; then
+        systemctl --no-block try-restart tain-daemon.service || true
+    fi
+fi
+
+# Fresh install only; upgrades stay quiet.
+if [ "${1:-}" = configure ] && [ -z "${2:-}" ] \
+    && { [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; }; then
     echo "tain: pick one of the two supported shapes:"
     echo "  systemctl enable --now tain-sync.timer     # systemd-managed cadence"
     echo "  systemctl enable --now tain-daemon.service # built-in croner scheduler"

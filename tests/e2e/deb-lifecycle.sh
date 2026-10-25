@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # .deb lifecycle e2e test in a Debian container (requires docker):
-# fresh install, upgrade keeps user config, purge keeps /srv/mirrors data,
-# reinstall onto existing /srv/mirrors.
+# fresh install, upgrade keeps user config, purge keeps /srv/mirrors data and
+# the tain account that owns it,
+# reinstall onto existing /srv/mirrors, purge keeps operator files in /etc/tain.
 #
 # Usage: tests/e2e/deb-lifecycle.sh [path/to/tain.deb]   # no arg: build .deb in docker
 #
@@ -99,11 +100,11 @@ set -x
 assert() { if ! eval "$1"; then echo "ASSERT FAIL: $1  ($2)" >&2; exit 42; fi; }
 assert_not() { if eval "$1"; then echo "ASSERT FAIL (should be false): $1  ($2)" >&2; exit 42; fi; }
 
-# Declared deps plus adduser (absent on -slim images), installed before
+# Declared deps (adduser and procps are absent on -slim images), installed before
 # dpkg -i so configure does not leave the package half-installed.
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-    ca-certificates tzdata adduser >/dev/null
+    ca-certificates tzdata adduser procps >/dev/null
 
 # Scenario 1: Fresh install (dpkg -i)
 echo "=== SCENARIO 1: fresh install ==="
@@ -208,19 +209,27 @@ done
 
 echo "=== SCENARIO 2 PASS ==="
 
-# Scenario 3: Purge — everything the pkg created goes; data survives
-echo "=== SCENARIO 3: purge cleans user, group, /etc/tain; preserves /srv/mirrors ==="
+# Scenario 3: Purge — config goes; data and the account that owns it survive
+echo "=== SCENARIO 3: purge cleans /etc/tain; preserves /srv/mirrors and the tain account ==="
 
 mkdir -p /srv/mirrors/precious-mirror-data
 echo "test-payload-$(date +%s)" > /srv/mirrors/precious-mirror-data/marker
 DATA_INODE="$(stat -c %i /srv/mirrors/precious-mirror-data/marker)"
+# A mirror subdirectory written by the service account, as tain sync does.
+su -s /bin/sh tain -c "mkdir /srv/mirrors/debian && touch /srv/mirrors/debian/pool-file"
+TAIN_UID="$(id -u tain)"
+TAIN_GID="$(getent group tain | cut -d: -f3)"
 
 dpkg --purge tain
 
 assert_not "[ -x /usr/bin/tain ]"                         "/usr/bin/tain removed"
 assert_not "[ -d /etc/tain ]"                             "/etc/tain removed (postrm purge)"
-assert_not "id tain >/dev/null 2>&1"                      "tain user removed"
-assert_not "getent group tain >/dev/null 2>&1"            "tain group removed"
+# Deleting the account would let a new account reuse the UID and own the data.
+assert "[ \"$(id -u tain)\" = $TAIN_UID ]"                "tain user kept with same uid on purge"
+assert "[ \"$(getent group tain | cut -d: -f3)\" = $TAIN_GID ]" "tain group kept with same gid on purge"
+adduser --system --group --no-create-home other-svc >/dev/null 2>&1
+assert "[ \"$(id -u other-svc)\" != $TAIN_UID ]"          "new system user does not reuse tain uid"
+assert "[ \"$(stat -c %U /srv/mirrors/debian)\" = tain ]" "mirror subdir still owned by tain"
 
 for u in tain-sync.service tain-sync.timer tain-daemon.service tain@.service; do
     assert_not "[ -f /usr/lib/systemd/system/$u ]"            "$u removed"
@@ -245,12 +254,23 @@ assert "[ \"$SRV_OWNER\" = tain:tain ]"                "existing /srv/mirrors ow
 SRV_PERM="$(stat -c %a /srv/mirrors)"
 assert "[ \"$SRV_PERM\" = 755 ]"                       "existing /srv/mirrors mode kept (got $SRV_PERM)"
 assert "su -s /bin/sh tain -c \"touch /srv/mirrors/.write-test\"" "tain can write /srv/mirrors"
+assert "[ \"$(id -u tain)\" = $TAIN_UID ]"             "reinstall reuses the kept tain uid"
+assert "su -s /bin/sh tain -c \"touch /srv/mirrors/debian/.write-test /srv/mirrors/debian/pool-file\"" \
+    "tain can still write a mirror subdir created before purge"
 assert "[ -f /srv/mirrors/precious-mirror-data/marker ]" "operator data still present"
 
 echo "=== SCENARIO 4 PASS ==="
 
+# Scenario 5: purge removes only the generated config from /etc/tain
+echo "=== SCENARIO 5: purge keeps operator files in /etc/tain ==="
+echo "# operator-owned" > /etc/tain/extra.toml
+dpkg --purge tain
+assert_not "[ -f /etc/tain/config.toml ]"              "generated config.toml removed on purge"
+assert "grep -q operator-owned /etc/tain/extra.toml"   "operator file /etc/tain/extra.toml kept on purge"
+echo "=== SCENARIO 5 PASS ==="
+
 echo "=== ALL SCENARIOS PASS ==="
 '
 
-pass "all four lifecycle scenarios PASSED"
+pass "all five lifecycle scenarios PASSED"
 exit 0

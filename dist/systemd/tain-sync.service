@@ -9,6 +9,11 @@ Type=oneshot
 User=tain
 Group=tain
 ExecStart=/usr/bin/tain sync --config /etc/tain/config.toml
+# Oneshot units have no start timeout by default; a hung sync would block
+# every later run. Generous enough for a first full sync of a large mirror;
+# a sync killed by it is safe and resumes next run (downloaded pool files
+# are kept).
+TimeoutStartSec=1d
 
 # --- Hardening ---
 NoNewPrivileges=yes
@@ -23,12 +28,24 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# DNS and HTTP(S) only.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Mirror files must be world-readable for the web server.
+UMask=0022
 # Adjust ReadWritePaths to where your mirror actually lives.
 ReadWritePaths=/srv/mirrors
 
 # --- Resource footprint ---
 IOSchedulingClass=idle
 Nice=10
+# Safety net against runaway memory use; raise for very large mirrors.
+MemoryMax=4G
 
 # Exit codes: 0 ok, 1 partial, 2 config error, 3 lock held, 4 fatal I/O.
 # 1 and 3 are usually retryable; 2 and 4 need operator attention.

@@ -19,6 +19,7 @@ VOLUME ["/data"]
 # Override the uid with --user (or Compose `user:`, K8s runAsUser) to match
 # the owner of a bind-mounted data dir.
 ENTRYPOINT ["/usr/local/bin/tain"]
-# daemon needs TAIN_SCHEDULE or global.schedule (else exits 2).
-# Use `sync` instead when an external scheduler drives the runs.
-CMD ["daemon", "--config", "/etc/tain/config.toml"]
+# Config source, as on the host: TAIN_CONFIG, else /etc/tain/config.toml if
+# mounted, else TAIN_URL/TAIN_DISTS. daemon needs TAIN_SCHEDULE or
+# global.schedule (else exits 2); use `sync` when an external scheduler runs it.
+CMD ["daemon"]

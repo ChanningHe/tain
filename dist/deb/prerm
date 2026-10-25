@@ -1,9 +1,16 @@
 #!/bin/sh
 set -eu
 
-if [ "$1" = "remove" ] && ([ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]); then
+[ "$1" = "remove" ] || exit 0
+
+if [ -d /run/systemd/system ]; then
     systemctl stop tain-sync.timer 2>/dev/null || true
+    systemctl stop tain-sync.service 2>/dev/null || true
     systemctl stop tain-daemon.service 2>/dev/null || true
+    systemctl stop 'tain@*.service' 2>/dev/null || true
+fi
+# disable also works offline (chroot, image build), so only needs systemctl.
+if command -v systemctl >/dev/null 2>&1; then
     systemctl disable tain-sync.timer 2>/dev/null || true
     systemctl disable tain-daemon.service 2>/dev/null || true
 fi

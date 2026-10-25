@@ -15,7 +15,7 @@ User=tain
 Group=tain
 ExecStart=/usr/bin/tain daemon --config /etc/tain/config.toml
 # Reload re-reads the config; a bad config keeps the previous one live.
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=30s
 
@@ -37,11 +37,23 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# DNS and HTTP(S) only.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Mirror files must be world-readable for the web server.
+UMask=0022
 ReadWritePaths=/srv/mirrors
 
 # --- Resource footprint ---
 IOSchedulingClass=idle
 Nice=10
+# Safety net against runaway memory use; raise for very large mirrors.
+MemoryMax=4G
 
 [Install]
 WantedBy=multi-user.target
