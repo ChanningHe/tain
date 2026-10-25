@@ -1,5 +1,6 @@
 //! `state.json`: per-mirror generation counter, upstream URL, and the last
-//! successful InRelease snapshot per suite (hash, `Date`, cache validators).
+//! successful signed-body snapshot per suite (change token, `Date`, cache
+//! validators).
 //! Written atomically (tmp, fsync, rename); a missing file means first run.
 
 use std::collections::BTreeMap;
@@ -49,7 +50,9 @@ impl MirrorState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SuiteState {
-    /// SHA-256 of the last synced `InRelease`.
+    /// Change token of the last synced signed body (`InRelease`, or
+    /// `Release` for detached-signature upstreams): SHA-256 over its
+    /// whitespace-canonical form. A v0.1.0 raw-bytes SHA-256 still matches.
     pub token_sha256: String,
     /// Raw `Date` field, for the Date-monotonicity check.
     pub date_raw: Option<String>,

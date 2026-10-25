@@ -229,6 +229,24 @@ impl SyntheticRepo {
         self
     }
 
+    /// Add a package whose `Filename` is exactly `filename` (hostile-index
+    /// tests). Its bytes are written there first, so a later root or index
+    /// file at the same path overwrites them.
+    #[must_use]
+    pub fn add_package_at(
+        mut self,
+        name: impl Into<String>,
+        filename: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        self.packages.push(Package {
+            name: name.into(),
+            filename: filename.into(),
+            bytes,
+        });
+        self
+    }
+
     /// Also write a compressed `Packages<suffix>` and list it in Release.
     #[must_use]
     pub fn with_compressed_variant(mut self, kind: PackagesVariantKind) -> Self {

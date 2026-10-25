@@ -1,6 +1,8 @@
 //! Derive the pool wanted set from staged Packages / Sources / SHA256SUMS.
 //!
-//! Weak-only entries are dropped unless `verify.allow_weak_hash` is set.
+//! Weak-only entries fail the index unless `verify.allow_weak_hash` is set:
+//! byte fidelity forbids dropping them from the published index, and
+//! skipping their pool files would leave clients with 404s.
 
 use std::io::BufReader;
 use std::path::Path;
@@ -20,8 +22,45 @@ use super::AptFlowError;
 /// entries, so 5M is ample headroom.
 const MAX_FILESPEC_COUNT: usize = 5_000_000;
 
+/// Package names quoted in the weak-digest error.
+const WEAK_EXAMPLES: usize = 5;
+
+/// Weak-digest-only entries of one index, reported together.
+#[derive(Default)]
+struct WeakOnly {
+    count: usize,
+    examples: Vec<String>,
+}
+
+impl WeakOnly {
+    fn note(&mut self, name: String) {
+        self.count += 1;
+        if self.examples.len() < WEAK_EXAMPLES {
+            self.examples.push(name);
+        }
+    }
+
+    fn into_result(self, index: &str) -> Result<(), AptFlowError> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        let more = if self.count > self.examples.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        Err(AptFlowError::WeakDigestOnlyEntries {
+            index: index.to_owned(),
+            count: self.count,
+            examples: format!("{}{more}", self.examples.join(", ")),
+        })
+    }
+}
+
+/// `index` names the Release-relative index in errors.
 pub(super) fn parse_sources_into(
     path: &Path,
+    index: &str,
     compression: Compression,
     layout: &SuiteLayout<'_>,
     allow_weak: bool,
@@ -32,6 +71,7 @@ pub(super) fn parse_sources_into(
         source: e,
     })?;
     let mut deb = Deb822Reader::new(BufReader::new(reader));
+    let mut weak = WeakOnly::default();
     while let Some(p) = deb.read_paragraph().map_err(AptFlowError::from)? {
         match paragraph_to_sourcespecs(&p, layout, allow_weak) {
             Ok(specs) => {
@@ -42,13 +82,13 @@ pub(super) fn parse_sources_into(
                 }
                 out.extend(specs);
             }
-            Err(SourceParseError::WeakDigestOnly { .. }) if !allow_weak => {
-                // Dropped by weak-hash policy.
+            Err(SourceParseError::WeakDigestOnly { package, filename }) => {
+                weak.note(format!("{package} ({filename})"));
             }
             Err(e) => return Err(AptFlowError::Source(e)),
         }
     }
-    Ok(())
+    weak.into_result(index)
 }
 
 /// Parse a staged d-i `SHA256SUMS`; listed files are relative to
@@ -77,8 +117,10 @@ pub(super) fn parse_installer_sums_into(
     Ok(())
 }
 
+/// `index` names the Release-relative index in errors.
 pub(super) fn parse_packages_into(
     path: &Path,
+    index: &str,
     compression: Compression,
     layout: &SuiteLayout<'_>,
     allow_weak: bool,
@@ -89,6 +131,7 @@ pub(super) fn parse_packages_into(
         source: e,
     })?;
     let mut deb = Deb822Reader::new(BufReader::new(reader));
+    let mut weak = WeakOnly::default();
     while let Some(p) = deb.read_paragraph().map_err(AptFlowError::from)? {
         match paragraph_to_filespec(&p, layout, allow_weak) {
             Ok(spec) => {
@@ -99,11 +142,33 @@ pub(super) fn parse_packages_into(
                 }
                 out.push(spec);
             }
-            Err(PackageParseError::WeakDigestOnly { .. }) if !allow_weak => {
-                // Dropped by weak-hash policy.
-            }
+            Err(PackageParseError::WeakDigestOnly { package }) => weak.note(package),
             Err(e) => return Err(AptFlowError::Package(e)),
         }
     }
-    Ok(())
+    weak.into_result(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weak_only_report_lists_a_bounded_sample() {
+        let mut weak = WeakOnly::default();
+        for i in 0..7 {
+            weak.note(format!("pkg{i}"));
+        }
+        let err = weak.into_result("main/binary-amd64/Packages").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("7 entries"), "{msg}");
+        assert!(msg.contains("pkg4, ..."), "{msg}");
+        assert!(!msg.contains("pkg5"), "{msg}");
+        assert!(msg.contains("allow_weak_hash"), "{msg}");
+    }
+
+    #[test]
+    fn no_weak_entries_is_ok() {
+        assert!(WeakOnly::default().into_result("x").is_ok());
+    }
 }

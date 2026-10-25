@@ -1,12 +1,13 @@
 //! Index staging.
 //!
-//! Stages every served variant of each selected index group. 404s are
-//! tolerated (indexes are often listed but not served), but each parse
-//! group must land at least one variant.
+//! Stages every served variant of each selected index group. 404s (and the
+//! 403s S3-style hosts send for missing objects) are tolerated (indexes are
+//! often listed but not served), but each parse group must land at least
+//! one variant.
 
 use std::path::{Path, PathBuf};
 
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use tracing::debug;
 
 use crate::backends::apt::checksums::ChecksumEntry;
@@ -18,6 +19,7 @@ use crate::core::types::DigestAlgo;
 use super::AptFlowError;
 use super::hex::hex_of;
 use super::pool_download::{FetchTuning, download_verified};
+use super::root_fetch::is_absent_status;
 
 #[derive(Debug, Clone)]
 pub(super) struct StagedIndex<'a> {
@@ -137,10 +139,10 @@ async fn stage_one_variant(
                 debug!(url = %by_hash_url, "index staged via by-hash URL");
                 return Ok(StageOutcome::Staged(dest));
             }
-            Err(AptFlowError::UpstreamStatus { status, .. }) if status == StatusCode::NOT_FOUND => {
+            Err(AptFlowError::UpstreamStatus { status, .. }) if is_absent_status(status) => {
                 debug!(
                     url = %by_hash_url,
-                    "by-hash URL 404 — falling back to canonical name"
+                    "by-hash URL absent — falling back to canonical name"
                 );
             }
             Err(e) => {
@@ -165,12 +167,12 @@ async fn stage_one_variant(
     .await
     {
         Ok(()) => Ok(StageOutcome::Staged(dest)),
-        Err(AptFlowError::UpstreamStatus { status, .. }) if status == StatusCode::NOT_FOUND => {
+        Err(AptFlowError::UpstreamStatus { status, .. }) if is_absent_status(status) => {
             // Common for uncompressed variants; the caller enforces
             // at-least-one per group.
             debug!(
                 url = %canonical_url,
-                "index variant listed in Release but returned 404 — accepting"
+                "index variant listed in Release but not served — accepting"
             );
             Ok(StageOutcome::ListedButNotServed)
         }

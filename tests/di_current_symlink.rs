@@ -40,6 +40,9 @@ struct DiRepo {
     images: Vec<DiImage>,
     /// Path whose SHA256SUMS entry gets a bogus hash.
     tamper_hash_for: Option<String>,
+    /// Images Release also lists (as Debian does for `MD5SUMS`), with the
+    /// bytes Release advertises for them.
+    release_listed: Vec<(String, Vec<u8>)>,
 }
 
 impl DiRepo {
@@ -52,7 +55,14 @@ impl DiRepo {
             version: "20250803+deb13u5".to_owned(),
             images: Vec::new(),
             tamper_hash_for: None,
+            release_listed: Vec::new(),
         }
+    }
+
+    /// Also list `images/<rel_path>` in Release, advertising `bytes`.
+    fn list_in_release(mut self, rel_path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        self.release_listed.push((rel_path.into(), bytes));
+        self
     }
 
     fn add_image(mut self, rel_path: impl Into<String>, bytes: Vec<u8>) -> Self {
@@ -106,18 +116,30 @@ impl DiRepo {
         let sums_bytes = sums.into_bytes();
         std::fs::write(images_dir.join("SHA256SUMS"), &sums_bytes).unwrap();
 
-        let sha256_line = format!(
+        let mut sha256_line = format!(
             " {} {} {}/SHA256SUMS\n",
             hex_encode(&Sha256::digest(&sums_bytes)),
             sums_bytes.len(),
             images_rel,
         );
-        let sha512_line = format!(
+        let mut sha512_line = format!(
             " {} {} {}/SHA256SUMS\n",
             hex_encode(&Sha512::digest(&sums_bytes)),
             sums_bytes.len(),
             images_rel,
         );
+        for (rel, bytes) in &self.release_listed {
+            sha256_line.push_str(&format!(
+                " {} {} {images_rel}/{rel}\n",
+                hex_encode(&Sha256::digest(bytes)),
+                bytes.len(),
+            ));
+            sha512_line.push_str(&format!(
+                " {} {} {images_rel}/{rel}\n",
+                hex_encode(&Sha512::digest(bytes)),
+                bytes.len(),
+            ));
+        }
         // Empty Packages: a Packages group must land at least one variant.
         let packages_body = b"";
         let bin_dir = dists_dir.join(format!("{}/binary-{}", self.component, self.arch));
@@ -251,6 +273,51 @@ async fn syncs_full_di_tree_with_current_symlink() {
     assert!(
         m.files.keys().any(|k| k.ends_with("/netboot/mini.iso")),
         "manifest records image files"
+    );
+}
+
+/// Debian's Release lists `images/MD5SUMS`, which SHA256SUMS lists too:
+/// the same bytes from two verified sources are not a conflict.
+#[tokio::test]
+async fn release_listed_image_with_same_hash_syncs() {
+    let serve_dir = TempDir::new("di-dup-serve");
+    let md5sums = b"d41d8cd98f00b204e9800998ecf8427e  ./boot.img.gz\n".to_vec();
+    let _repo = DiRepo::new(serve_dir.path().to_path_buf())
+        .add_image("boot.img.gz", b"boot img content".to_vec())
+        .add_image("MD5SUMS", md5sums.clone())
+        .list_in_release("MD5SUMS", md5sums.clone())
+        .write();
+    let server = StaticServer::spawn(serve_dir.path().to_path_buf()).await;
+
+    let target = TempDir::new("di-dup-target");
+    let global = build_global(target.path().to_path_buf());
+    let mirror = build_mirror(&server.base_url(), "di");
+    let outcome = sync_mirror(&global, &mirror, &global.target).await.unwrap();
+    assert!(outcome.is_success(), "{outcome:?}");
+    let published = target
+        .path()
+        .join("di/dists/trixie/main/installer-amd64/20250803+deb13u5/images/MD5SUMS");
+    assert_eq!(std::fs::read(published).unwrap(), md5sums);
+}
+
+/// The same path with different bytes in Release and SHA256SUMS is refused.
+#[tokio::test]
+async fn release_listed_image_with_other_hash_fails_the_suite() {
+    let serve_dir = TempDir::new("di-dup-bad-serve");
+    let _repo = DiRepo::new(serve_dir.path().to_path_buf())
+        .add_image("MD5SUMS", b"what SHA256SUMS vouches for\n".to_vec())
+        .list_in_release("MD5SUMS", b"what Release vouches for\n".to_vec())
+        .write();
+    let server = StaticServer::spawn(serve_dir.path().to_path_buf()).await;
+
+    let target = TempDir::new("di-dup-bad-target");
+    let global = build_global(target.path().to_path_buf());
+    let mirror = build_mirror(&server.base_url(), "di");
+    let outcome = sync_mirror(&global, &mirror, &global.target).await.unwrap();
+    assert_eq!(
+        outcome.suites_failed,
+        vec!["trixie".to_owned()],
+        "{outcome:?}"
     );
 }
 
