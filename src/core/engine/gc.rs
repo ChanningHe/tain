@@ -1,7 +1,7 @@
 //! Manifest-diff GC.
 //!
-//! Referenced = files in the newest `keep_generations` manifests plus the
-//! newest `keep_generations` `.tain/prev/**/<gen>/` dirs. Candidates are
+//! Referenced = files in the newest `keep_generations` manifests plus, per
+//! suite, the newest `keep_generations` `.tain/prev/<suite>/<gen>/` dirs. Candidates are
 //! unreferenced files under `pool/`, `dists/`, `.tain/prev/` older than
 //! `grace_period`. If candidates exceed `max_delete_ratio` of the scan (by
 //! count or bytes) nothing is deleted, so an empty-index publish can't wipe
@@ -77,8 +77,10 @@ pub fn run_gc(mirror_root: &Path, opts: &GcOptions, now: SystemTime) -> Result<G
         dry_run: opts.dry_run,
         ..GcResult::default()
     };
-    let mut referenced = load_reference_set(mirror_root, opts.keep_generations)?;
-    extend_with_prev_generations(&mut referenced, mirror_root, opts.keep_generations)?;
+    // Zero would unreference the current generation; same floor as pruning.
+    let keep = opts.keep_generations.max(1);
+    let mut referenced = load_reference_set(mirror_root, keep)?;
+    extend_with_prev_generations(&mut referenced, mirror_root, keep)?;
     result.referenced = referenced.len();
     let scan = scan_disk(mirror_root)?;
     result.scanned = scan.len();
@@ -164,22 +166,31 @@ fn load_reference_set(
     Ok(out)
 }
 
-/// Mark every file in the newest `keep_generations` retired generation
-/// dirs under `.tain/prev/` as referenced.
+/// Mark every file in each suite's newest `keep_generations` retired
+/// generation dirs (`.tain/prev/<suite>/<gen>/`) as referenced. Counted per
+/// suite, so a busy suite cannot evict a quiet one's snapshots.
 fn extend_with_prev_generations(
     referenced: &mut HashSet<String>,
     mirror_root: &Path,
     keep_generations: u32,
 ) -> Result<(), GcError> {
-    if keep_generations == 0 {
-        return Ok(());
-    }
     let prev_root = mirror_root.join(".tain/prev");
-    let mut gen_dirs = collect_generation_dirs(&prev_root)?;
-    gen_dirs.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-    let take = (keep_generations as usize).min(gen_dirs.len());
-    for (_gen, dir) in &gen_dirs[..take] {
-        for file in walk_files(dir)? {
+    let mut by_suite: std::collections::BTreeMap<PathBuf, Vec<(u64, PathBuf)>> =
+        std::collections::BTreeMap::new();
+    for (generation, dir) in collect_generation_dirs(&prev_root)? {
+        let suite_dir = dir.parent().map(Path::to_path_buf).unwrap_or_default();
+        by_suite
+            .entry(suite_dir)
+            .or_default()
+            .push((generation, dir));
+    }
+    let kept = by_suite.into_values().flat_map(|mut gens| {
+        gens.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        gens.truncate(keep_generations as usize);
+        gens
+    });
+    for (_gen, dir) in kept {
+        for file in walk_files(&dir)? {
             if let Ok(rel) = file.strip_prefix(mirror_root) {
                 referenced.insert(rel.to_string_lossy().into_owned());
             }
@@ -321,9 +332,9 @@ fn compute_candidates(
         if referenced.contains(&rel) {
             continue;
         }
+        // A future mtime counts as brand new, not infinitely old.
         if let Some(mtime) = mtime
-            && let Ok(age) = now.duration_since(mtime)
-            && age < grace
+            && now.duration_since(mtime).unwrap_or_default() < grace
         {
             grace_skipped += 1;
             continue;
@@ -447,6 +458,21 @@ mod tests {
         assert_eq!(r.candidates.len(), 0);
         assert_eq!(r.skipped_grace, 1);
         assert!(root.join("pool/orphan.deb").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn future_mtime_is_within_grace() {
+        let root = temp_root("future-mtime");
+        manifest_with(&root, 1, &["pool/keep.deb"]);
+        write(&root.join("pool/keep.deb"), b"keep");
+        let orphan = root.join("pool/orphan.deb");
+        write(&orphan, b"orph");
+        set_mtime(&orphan, SystemTime::now() + Duration::from_secs(3600));
+        let r = run_gc(&root, &opts(true, 100, 0.9), SystemTime::now()).unwrap();
+        assert!(r.candidates.is_empty(), "{r:?}");
+        assert_eq!(r.skipped_grace, 1);
+        assert!(orphan.exists());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -602,6 +628,39 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A busy suite's retirements must not evict a quiet suite's only
+    /// rollback snapshots.
+    #[test]
+    fn prev_retention_counts_per_suite() {
+        let root = temp_root("prev-per-suite");
+        manifest_with(&root, 9, &["pool/keep.deb"]);
+        write(&root.join("pool/keep.deb"), b"keep");
+        write_prev(&root, "trixie", 1, "InRelease", b"quiet");
+        write_prev(
+            &root,
+            "bookworm-security/updates",
+            2,
+            "InRelease",
+            b"nested",
+        );
+        for g in 3..=6u64 {
+            write_prev(&root, "bookworm", g, "InRelease", b"busy");
+        }
+
+        let mut o = opts(true, 100, 0.99);
+        o.max_delete_byte_ratio = 0.99;
+        o.keep_generations = 3;
+        let r = run_gc(&root, &o, SystemTime::now()).unwrap();
+        assert_eq!(r.deleted.len(), 1, "only bookworm gen 3 evicted: {r:?}");
+        assert!(!root.join(".tain/prev/bookworm/3").exists());
+        assert!(root.join(".tain/prev/trixie/1/InRelease").exists());
+        assert!(
+            root.join(".tain/prev/bookworm-security/updates/2/InRelease")
+                .exists()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn oldest_prev_generation_evicted_when_window_slides() {
         let root = temp_root("prev-4-evict");
@@ -658,10 +717,17 @@ mod tests {
     }
 
     #[test]
-    fn keep_generations_zero_disables_prev_protection() {
+    fn keep_generations_zero_acts_as_one() {
+        // Same floor as manifest pruning; zero must not unreference the
+        // current generation.
         let root = temp_root("prev-zero");
+        manifest_with(&root, 2, &["pool/old.deb"]);
         manifest_with(&root, 3, &["pool/keep.deb"]);
-        write(&root.join("pool/keep.deb"), b"keep");
+        for name in ["pool/old.deb", "pool/keep.deb"] {
+            let p = root.join(name);
+            write(&p, b"deb");
+            set_mtime(&p, SystemTime::now() - Duration::from_secs(500_000));
+        }
         write_prev(&root, "bookworm", 1, "InRelease", b"snap");
         write_prev(&root, "bookworm", 2, "InRelease", b"snap");
 
@@ -669,9 +735,11 @@ mod tests {
         o.max_delete_byte_ratio = 0.99;
         o.keep_generations = 0;
         let r = run_gc(&root, &o, SystemTime::now()).unwrap();
-        assert_eq!(r.deleted.len(), 2, "both prev gens must be swept");
+        assert_eq!(r.deleted.len(), 2, "{r:?}");
+        assert!(root.join("pool/keep.deb").exists());
+        assert!(!root.join("pool/old.deb").exists());
+        assert!(root.join(".tain/prev/bookworm/2").exists());
         assert!(!root.join(".tain/prev/bookworm/1").exists());
-        assert!(!root.join(".tain/prev/bookworm/2").exists());
         std::fs::remove_dir_all(&root).ok();
     }
 

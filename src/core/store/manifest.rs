@@ -1,8 +1,8 @@
 //! Generation manifest (`.tain/manifest/<generation>.json`): the
-//! authoritative list of files a successful sync published. GC keeps the
-//! union of recent generations.
+//! authoritative list of files published as of a generation, across all
+//! suites. GC keeps the union of recent generations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,10 @@ pub struct GenerationManifest {
     pub generation: u64,
     /// Keyed by `rel_path`; ordered for stable JSON.
     pub files: BTreeMap<String, ManifestEntry>,
+    /// Suite → `rel_path`s it publishes, so an unchanged suite's files can
+    /// be carried into the next generation. Empty in older manifests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub suites: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl GenerationManifest {
@@ -64,11 +68,40 @@ impl GenerationManifest {
             schema: CURRENT_SCHEMA,
             generation,
             files: BTreeMap::new(),
+            suites: BTreeMap::new(),
         }
     }
 
     pub fn insert(&mut self, entry: ManifestEntry) {
         self.files.insert(entry.rel_path.clone(), entry);
+    }
+
+    /// Record `entries` as published by `suite`. A path already present
+    /// keeps its entry: freshly synced suites are recorded before carried
+    /// ones, so a carried entry never overwrites a newer download.
+    pub fn attribute(&mut self, suite: &str, entries: impl IntoIterator<Item = ManifestEntry>) {
+        let keys = self.suites.entry(suite.to_owned()).or_default();
+        for entry in entries {
+            keys.insert(entry.rel_path.clone());
+            self.files.entry(entry.rel_path.clone()).or_insert(entry);
+        }
+    }
+
+    /// Entries attributed to `suite`; `None` if it has no attribution.
+    #[must_use]
+    pub fn suite_entries(&self, suite: &str) -> Option<Vec<ManifestEntry>> {
+        let keys = self.suites.get(suite)?;
+        Some(
+            keys.iter()
+                .filter_map(|k| self.files.get(k).cloned())
+                .collect(),
+        )
+    }
+
+    /// True for manifests written before per-suite attribution existed.
+    #[must_use]
+    pub fn is_unattributed(&self) -> bool {
+        self.suites.is_empty()
     }
 
     #[must_use]
@@ -174,6 +207,46 @@ pub fn load(mirror_root: &Path, generation: u64) -> Result<GenerationManifest, M
         });
     }
     Ok(m)
+}
+
+/// Suites attributed in manifest `generation`, without materializing its
+/// file list. Empty when the manifest is missing, unreadable or
+/// unattributed.
+#[must_use]
+pub fn attributed_suites(mirror_root: &Path, generation: u64) -> BTreeSet<String> {
+    #[derive(Deserialize)]
+    struct Names {
+        #[serde(default)]
+        suites: BTreeMap<String, serde::de::IgnoredAny>,
+    }
+    if generation == 0 {
+        return BTreeSet::new();
+    }
+    std::fs::read(manifest_path(mirror_root, generation))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Names>(&b).ok())
+        .map(|n| n.suites.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Delete all but the newest `keep` manifests (at least one stays).
+/// Returns the removed generations.
+///
+/// # Errors
+///
+/// Directory read or `remove_file` failure.
+pub fn prune(mirror_root: &Path, keep: usize) -> Result<Vec<u64>, ManifestError> {
+    let gens = list_generations(mirror_root)?;
+    let excess = gens.len().saturating_sub(keep.max(1));
+    for generation in &gens[..excess] {
+        let path = manifest_path(mirror_root, *generation);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ManifestError::Io { path, source: e }),
+        }
+    }
+    Ok(gens[..excess].to_vec())
 }
 
 /// Generation numbers with a manifest on disk, ascending.
@@ -305,6 +378,68 @@ mod tests {
             matches!(err, ManifestError::SchemaMismatch { .. }),
             "{err:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn attribute_keeps_first_entry_and_records_suite() {
+        let mut m = GenerationManifest::new(1);
+        m.attribute("a", [sample_entry("pool/x.deb")]);
+        let mut other = sample_entry("pool/x.deb");
+        other.size = 999;
+        m.attribute("b", [other, sample_entry("dists/b/InRelease")]);
+        assert_eq!(m.files["pool/x.deb"].size, 100);
+        assert_eq!(m.suite_entries("b").unwrap().len(), 2);
+        assert_eq!(m.suite_entries("a").unwrap().len(), 1);
+        assert!(m.suite_entries("c").is_none());
+    }
+
+    #[test]
+    fn unattributed_json_loads_with_empty_suites() {
+        let root = temp_root("legacy");
+        ensure_state_dir(&root).unwrap();
+        std::fs::create_dir_all(manifest_dir(&root)).unwrap();
+        let raw = serde_json::json!({
+            "schema": CURRENT_SCHEMA,
+            "generation": 4u64,
+            "files": { "pool/x.deb": sample_entry("pool/x.deb") },
+        });
+        std::fs::write(manifest_path(&root, 4), raw.to_string()).unwrap();
+        let m = load(&root, 4).unwrap();
+        assert!(m.is_unattributed());
+        assert_eq!(m.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn attributed_suites_reads_names_only() {
+        let root = temp_root("names");
+        let mut m = GenerationManifest::new(2);
+        m.attribute("a", [sample_entry("dists/a/InRelease")]);
+        m.attribute("b", [sample_entry("dists/b/InRelease")]);
+        save(&root, &m).unwrap();
+        let mut legacy = GenerationManifest::new(3);
+        legacy.insert(sample_entry("pool/o.deb"));
+        save(&root, &legacy).unwrap();
+
+        let names: Vec<String> = attributed_suites(&root, 2).into_iter().collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(attributed_suites(&root, 3).is_empty(), "unattributed");
+        assert!(attributed_suites(&root, 9).is_empty(), "missing");
+        assert!(attributed_suites(&root, 0).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_keeps_newest_generations() {
+        let root = temp_root("prune");
+        for g in 1..=5u64 {
+            save(&root, &GenerationManifest::new(g)).unwrap();
+        }
+        assert_eq!(prune(&root, 3).unwrap(), vec![1, 2]);
+        assert_eq!(list_generations(&root).unwrap(), vec![3, 4, 5]);
+        assert_eq!(prune(&root, 0).unwrap(), vec![3, 4]);
+        assert_eq!(list_generations(&root).unwrap(), vec![5]);
         std::fs::remove_dir_all(&root).ok();
     }
 

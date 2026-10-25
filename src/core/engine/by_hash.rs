@@ -8,6 +8,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::core::store::manifest::ManifestEntry;
+
 /// By-hash slots for one staged index file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByHashInput<'a> {
@@ -162,6 +164,33 @@ fn walk_and_link(
         }
     }
     Ok(())
+}
+
+/// Manifest entries for the by-hash objects of `entries` present under
+/// `mirror_root`. Each is a hardlink of its index, so size and digests
+/// carry over. MD5-only objects can't be named from a manifest entry.
+#[must_use]
+pub fn published_objects(mirror_root: &Path, entries: &[ManifestEntry]) -> Vec<ManifestEntry> {
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.rel_path.starts_with("pool/") || entry.rel_path.contains("/by-hash/") {
+            continue;
+        }
+        let Some((dir, _)) = entry.rel_path.rsplit_once('/') else {
+            continue;
+        };
+        for (algo_dir, hex) in [("SHA256", &entry.sha256_hex), ("SHA512", &entry.sha512_hex)] {
+            let Some(hex) = hex else { continue };
+            let rel_path = format!("{dir}/by-hash/{algo_dir}/{hex}");
+            if mirror_root.join(&rel_path).is_file() {
+                out.push(ManifestEntry {
+                    rel_path,
+                    ..entry.clone()
+                });
+            }
+        }
+    }
+    out
 }
 
 fn is_inside_by_hash(path: &Path) -> bool {
@@ -321,6 +350,35 @@ mod tests {
         assert!(
             !staging.join("main/binary-amd64/Packages").exists(),
             "regular files stay in prev — only by-hash inherits"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn published_objects_names_existing_links_only() {
+        let root = temp_root("published");
+        let dir = "dists/bookworm/main/binary-amd64";
+        let sha256 = "a".repeat(64);
+        let sha512 = "b".repeat(128);
+        touch(&root.join(format!("{dir}/by-hash/SHA256/{sha256}")), b"x");
+        let index = ManifestEntry {
+            rel_path: format!("{dir}/Packages.xz"),
+            size: 1,
+            sha256_hex: Some(sha256.clone()),
+            sha512_hex: Some(sha512),
+        };
+        let pool = ManifestEntry {
+            rel_path: "pool/main/x/x.deb".to_owned(),
+            ..index.clone()
+        };
+        let got = published_objects(&root, &[index.clone(), pool]);
+        assert_eq!(
+            got,
+            vec![ManifestEntry {
+                rel_path: format!("{dir}/by-hash/SHA256/{sha256}"),
+                ..index
+            }],
+            "missing SHA512 link and pool entries are skipped"
         );
         std::fs::remove_dir_all(&root).ok();
     }

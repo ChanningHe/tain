@@ -182,7 +182,7 @@ fn run_sync(cfg: &Config, args: &SyncArgs) -> ExitCode {
                         mirror = %outcome.mirror_name,
                         succeeded = ?outcome.suites_succeeded,
                         unchanged = ?outcome.suites_unchanged,
-                        failed = ?outcome.suites_failed,
+                        failed = ?outcome.failed_suites(),
                         gen = outcome.new_generation,
                         "mirror outcome"
                     );

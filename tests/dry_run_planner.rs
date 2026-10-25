@@ -123,14 +123,14 @@ fn combined_overrides() -> SyncOverrides {
 /// Dry-run after a real sync leaves the mirror tree byte-identical.
 #[tokio::test]
 async fn dry_run_leaves_published_state_byte_identical() {
-    let serve = TempDir::new("dryrun-i1-serve");
+    let serve = TempDir::new("dryrun-identical-serve");
     SyntheticRepo::new(serve.path().to_path_buf(), "bookworm")
         .add_package("nginx", b"nginx bytes".to_vec())
         .add_package("curl", b"curl bytes".to_vec())
         .write();
     let server = StaticServer::spawn(serve.path().to_path_buf()).await;
 
-    let target = TempDir::new("dryrun-i1-target");
+    let target = TempDir::new("dryrun-identical-target");
     let global = build_global(target.path().to_path_buf());
     let mirror = build_mirror(&server.base_url(), "upstream");
 
@@ -364,7 +364,7 @@ async fn dry_run_wipes_staging_directory() {
         .await
         .unwrap();
 
-    let staging = target.path().join("upstream/.tain/staging/bookworm");
+    let staging = target.path().join("upstream/.tain/staging");
     assert!(
         !staging.exists(),
         "staging must be wiped at dry-run exit — found {}",
@@ -385,11 +385,15 @@ async fn failure_neutrality_dry_run_never_writes_on_missing_upstream() {
     let outcome = sync_mirror_with(&global, &mirror, &global.target, dry_run_overrides())
         .await
         .unwrap();
+    // Reported as failed (for the log), without failing the run.
+    assert_eq!(outcome.failed_suites(), vec!["bookworm"]);
+    assert!(outcome.is_success());
     let report = outcome.dry_run.expect("dry-run report");
     assert_eq!(report.suites.len(), 1);
     assert!(matches!(report.suites[0].verdict, SuiteVerdict::Failed(_)));
 
     let mirror_root = target.path().join("upstream");
+    assert!(!mirror_root.join(".tain/staging").exists());
     assert!(!mirror_root.join(".tain/state.json").exists());
     assert!(!mirror_root.join("pool").exists());
     assert!(!mirror_root.join("dists").exists());

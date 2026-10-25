@@ -1,4 +1,5 @@
-//! `verify` subcommand: re-hash every file in the latest manifest.
+//! `verify` subcommand: re-hash every file in the latest manifest, which
+//! covers every published suite.
 //!
 //! Unreferenced files on disk are GC's concern, not this scrub's.
 
@@ -65,6 +66,13 @@ pub fn scrub_latest(mirror_root: &Path) -> Result<VerifyReport, VerifyError> {
         });
     };
     let m = manifest::load(mirror_root, latest)?;
+    if m.is_unattributed() {
+        tracing::warn!(
+            generation = latest,
+            "manifest predates per-suite tracking and may omit suites unchanged in its \
+             generation; run a sync to complete it"
+        );
+    }
     let total = m.len();
     let mut report = VerifyReport {
         scanned: total,

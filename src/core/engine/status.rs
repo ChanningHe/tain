@@ -91,7 +91,8 @@ pub fn snapshot(
     let reason = if healthy == Some(false) {
         Some(match &age_verdict {
             AgeVerdict::Fresh(s) => format!(
-                "last successful sync was {} ago, outside healthy_within",
+                "upstream Release Date of the most recently published suite is {} old, \
+                 outside healthy_within",
                 format_duration(*s)
             ),
             AgeVerdict::FutureDate { by_secs, raw } => format!(
