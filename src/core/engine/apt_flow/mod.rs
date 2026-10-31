@@ -66,7 +66,8 @@ pub enum ApttSyncOutcome {
     DryRun(SuiteDryRun),
 }
 
-/// Sync one APT suite end-to-end.
+/// Sync one APT suite end-to-end. `published_manifest` is the manifest of
+/// the generation standing before this sync, if any.
 ///
 /// # Errors
 ///
@@ -84,6 +85,7 @@ pub async fn sync_apt_suite(
     tuning: &FetchTuning,
     retry_index_rounds: u32,
     dry_run: bool,
+    published_manifest: Option<&GenerationManifest>,
 ) -> Result<ApttSyncOutcome, AptFlowError> {
     let layout = SuiteLayout::new(&mirror.url, suite);
     let dist_dir = final_dist_path(mirror_root, &layout, suite);
@@ -120,6 +122,7 @@ pub async fn sync_apt_suite(
         published,
         staging: staging_dir(mirror_root, suite),
         dist_dir,
+        published_manifest,
     };
     let mut owned = OwnedKeys::default();
     let result = run

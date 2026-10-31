@@ -97,6 +97,9 @@ pub(super) struct SuiteRun<'a> {
     pub(super) published: PublishedRoot,
     pub(super) staging: PathBuf,
     pub(super) dist_dir: PathBuf,
+    /// Manifest of the generation standing before this sync, if any.
+    #[expect(dead_code, reason = "threaded through for later use; not read yet")]
+    pub(super) published_manifest: Option<&'a GenerationManifest>,
 }
 
 impl SuiteRun<'_> {

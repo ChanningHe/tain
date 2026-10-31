@@ -262,6 +262,7 @@ async fn sync_suite_direct(
         &FetchTuning::from(global),
         global.retry.index_rounds,
         false,
+        None,
     )
     .await
 }

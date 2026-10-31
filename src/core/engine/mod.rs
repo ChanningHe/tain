@@ -6,27 +6,34 @@
 //! lock() → plan_suite() → fetch_indexes() → parse_packages()
 //!        → fetch_pool() → publish_suite() → write state/manifest → unlock()
 //! ```
+//!
+//! [`sync_mirror_with_budget`] runs it as phases: `open_mirror` →
+//! `mirror_client` → `sync_suites` → `carry_forward_phase` →
+//! `persist_generation` → `run_gc_phase` → `dry_run_report` →
+//! `build_outcome`.
 
 pub mod apt_flow;
 pub mod by_hash;
 pub mod gc;
 pub mod publish;
 pub mod status;
+mod suites;
 pub mod verify;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use crate::config::model::{BackendKind, BackendOptions, MirrorConfig};
+use crate::config::model::{BackendKind, GlobalConfig, MirrorConfig};
 use crate::core::fetch::budget::{Budget, BudgetConfig};
 use crate::core::fetch::client::{ClientConfig, ClientError, build_client};
-use crate::core::store::state::{MirrorState, SuiteState};
+use crate::core::store::state::MirrorState;
 use crate::core::store::{lock, manifest, state};
 
-use apt_flow::{
-    AptFlowError, ApttSyncOutcome, DryRunReport, FetchTuning, SuiteDryRun, sync_apt_suite,
-};
+use apt_flow::{AptFlowError, DryRunReport, GcPreview, SuiteDryRun};
+use suites::{SuiteResults, sync_suites};
 
 use crate::backends::apt::pgp::VerifyOutcome as PgpVerifyOutcome;
 
@@ -124,7 +131,7 @@ pub async fn sync_mirror_with(
 ///
 /// Same as [`sync_mirror`].
 pub async fn sync_mirror_with_budget(
-    global: &crate::config::model::GlobalConfig,
+    global: &GlobalConfig,
     mirror: &MirrorConfig,
     target_root: &Path,
     overrides: SyncOverrides,
@@ -134,262 +141,331 @@ pub async fn sync_mirror_with_budget(
         BackendKind::Apt => {}
     }
 
-    let mirror_root = target_root.join(&mirror.path);
-    std::fs::create_dir_all(&mirror_root).map_err(|e| EngineError::Io {
-        path: mirror_root.clone(),
+    let mut open = open_mirror(global, mirror, target_root)?;
+    let client = mirror_client(global, mirror)?;
+    sweep_tmp_sidecars(&open.root);
+    let run = MirrorRun {
+        global,
+        mirror,
+        root: &open.root,
+        client: &client,
+        budget,
+        overrides,
+        started: Instant::now(),
+    };
+
+    let latest = load_manifest(run.root, open.state.generation);
+    let mut suites = sync_suites(&run, &mut open.state, latest.as_ref()).await?;
+    let untracked = carry_forward_phase(&run, &mut suites, &open.state, latest.as_ref());
+    let persisted =
+        persist_generation(&run, &mut open.state, &suites, latest.as_ref(), &untracked)?;
+    let gc = run_gc_phase(&run, &suites, &untracked, open.is_migration_boot);
+    let dry_run = dry_run_report(&run, std::mem::take(&mut suites.dry_run), gc.as_ref());
+    Ok(build_outcome(
+        &run,
+        suites,
+        &open.state,
+        persisted,
+        latest.as_ref(),
+        gc,
+        dry_run,
+    ))
+}
+
+/// Inputs every phase of one mirror sync shares.
+struct MirrorRun<'a> {
+    global: &'a GlobalConfig,
+    mirror: &'a MirrorConfig,
+    root: &'a Path,
+    client: &'a Client,
+    budget: &'a Budget,
+    overrides: SyncOverrides,
+    started: Instant,
+}
+
+/// A created and locked mirror root with its loaded state.
+struct OpenMirror {
+    root: PathBuf,
+    state: MirrorState,
+    /// Legacy content without `state.json`: GC is forced to dry-run.
+    is_migration_boot: bool,
+    _lock: lock::MirrorLock,
+}
+
+/// Create and lock the mirror root, then load its state.
+fn open_mirror(
+    global: &GlobalConfig,
+    mirror: &MirrorConfig,
+    target_root: &Path,
+) -> Result<OpenMirror, EngineError> {
+    let root = target_root.join(&mirror.path);
+    std::fs::create_dir_all(&root).map_err(|e| EngineError::Io {
+        path: root.clone(),
         source: e,
     })?;
-
-    let _guard = lock::acquire(&mirror_root, global.lock_timeout).map_err(|e| match e {
+    let lock = lock::acquire(&root, global.lock_timeout).map_err(|e| match e {
         lock::LockError::Contended { .. } => EngineError::LockContended(e),
         other => EngineError::Lock(other),
     })?;
+    let (state, is_migration_boot) = load_state(&root, mirror)?;
+    Ok(OpenMirror {
+        root,
+        state,
+        is_migration_boot,
+        _lock: lock,
+    })
+}
 
-    let (mut state, is_migration_boot) =
-        match state::load_for_url(&mirror_root, mirror.url.as_str()) {
-            Ok(Some(s)) => (s, false),
-            Ok(None) => {
-                // Migration guard: existing content without state.json means a
-                // legacy mirror; force GC dry-run so its pool isn't wiped.
-                let looks_migrated =
-                    mirror_root_has_non_tain_content(&mirror_root).unwrap_or(false);
-                if looks_migrated {
-                    warn!(
-                        mirror = %mirror.name,
-                        mirror_root = %mirror_root.display(),
-                        "no state.json but mirror_root already has content — assuming migration \
-                         from a legacy layout; forcing GC to dry-run for this round. \
-                         Verify the recovered manifest with `tain verify --mirror {name}` before \
-                         enabling live GC.",
-                        name = mirror.name,
-                    );
-                }
-                (MirrorState::new(mirror.url.to_string()), looks_migrated)
-            }
-            Err(state::StateError::UrlMismatch { .. }) => {
+/// The mirror's state and whether this is a migration boot.
+fn load_state(
+    mirror_root: &Path,
+    mirror: &MirrorConfig,
+) -> Result<(MirrorState, bool), EngineError> {
+    match state::load_for_url(mirror_root, mirror.url.as_str()) {
+        Ok(Some(s)) => Ok((s, false)),
+        Ok(None) => {
+            // Migration guard: existing content without state.json means a
+            // legacy mirror; force GC dry-run so its pool isn't wiped.
+            let looks_migrated = mirror_root_has_non_tain_content(mirror_root).unwrap_or(false);
+            if looks_migrated {
                 warn!(
                     mirror = %mirror.name,
-                    "state file records a different URL — discarding state (the published Release \
-                     Date still applies as the monotonicity floor)"
+                    mirror_root = %mirror_root.display(),
+                    "no state.json but mirror_root already has content — assuming migration \
+                     from a legacy layout; forcing GC to dry-run for this round. \
+                     Verify the recovered manifest with `tain verify --mirror {name}` before \
+                     enabling live GC.",
+                    name = mirror.name,
                 );
-                (MirrorState::new(mirror.url.to_string()), false)
             }
-            Err(e) => return Err(EngineError::State(e)),
-        };
+            Ok((MirrorState::new(mirror.url.to_string()), looks_migrated))
+        }
+        Err(state::StateError::UrlMismatch { .. }) => {
+            warn!(
+                mirror = %mirror.name,
+                "state file records a different URL — discarding state (the published Release \
+                 Date still applies as the monotonicity floor)"
+            );
+            Ok((MirrorState::new(mirror.url.to_string()), false))
+        }
+        Err(e) => Err(EngineError::State(e)),
+    }
+}
 
-    let mut client_cfg = ClientConfig::from(global);
+/// The HTTP client of one mirror.
+fn mirror_client(global: &GlobalConfig, mirror: &MirrorConfig) -> Result<Client, EngineError> {
+    let base = ClientConfig::from(global);
     // Some CDNs bungle H2 for large-file transfers.
-    if mirror.force_http1 {
-        client_cfg.http1_only = true;
-    }
-    let client = build_client(&client_cfg).map_err(EngineError::Client)?;
-    let tuning = FetchTuning::from(global);
-
-    sweep_tmp_sidecars(&mirror_root);
-
-    let BackendOptions::Apt(apt_opts) = &mirror.backend_options;
-
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
-    let mut unchanged = Vec::new();
-    let attributed = manifest::attributed_suites(&mirror_root, state.generation);
-    let mut new_manifest =
-        manifest::GenerationManifest::new(next_generation(&mirror_root, state.generation));
-    let mut pgp_by_suite: Vec<(String, PgpVerifyOutcome)> = Vec::new();
-    let mut dry_run_suites: Vec<SuiteDryRun> = Vec::new();
-    let sync_started_at = std::time::Instant::now();
-
-    for suite in &apt_opts.suites {
-        info!(mirror = %mirror.name, %suite, "sync suite");
-        let prior = state.suites.get(suite).cloned().unwrap_or_default();
-        let prior = resync_if_unattributed(prior, suite, &attributed);
-        // Per suite, so a failed or refolded suite can't drop shared entries.
-        let mut suite_manifest = manifest::GenerationManifest::new(new_manifest.generation);
-        let outcome = sync_apt_suite(
-            &client,
-            budget,
-            mirror,
-            apt_opts,
-            &mirror_root,
-            suite,
-            &prior,
-            &mut suite_manifest,
-            &tuning,
-            global.retry.index_rounds,
-            overrides.dry_run,
-        )
-        .await;
-
-        match outcome {
-            Ok(ApttSyncOutcome::Unchanged) => {
-                unchanged.push(suite.clone());
-                info!(mirror = %mirror.name, %suite, "suite unchanged (304 or same InRelease hash)");
-            }
-            Ok(ApttSyncOutcome::Updated {
-                token_sha256,
-                date_raw,
-                etag,
-                last_modified,
-                pgp,
-            }) => {
-                succeeded.push(suite.clone());
-                let entries = suite_manifest.files.into_values().collect();
-                record_suite(&mut new_manifest, &mirror_root, suite, entries);
-                pgp_by_suite.push((suite.clone(), pgp));
-                state.suites.insert(
-                    suite.clone(),
-                    SuiteState {
-                        token_sha256,
-                        date_raw,
-                        etag,
-                        last_modified,
-                        generation: new_manifest.generation,
-                    },
-                );
-                info!(mirror = %mirror.name, %suite, "suite published");
-            }
-            Ok(ApttSyncOutcome::DryRun(sd)) => {
-                info!(
-                    mirror = %mirror.name,
-                    %suite,
-                    verdict = %sd.verdict,
-                    pool_would_download = sd.pool_would_download.len(),
-                    pool_already_present = sd.pool_already_present,
-                    bytes_estimate = sd.bytes_estimate,
-                    "dry-run suite plan"
-                );
-                dry_run_suites.push(sd);
-            }
-            Err(e) => {
-                // Full disk / unwritable target is environmental: fail the
-                // whole mirror (exit 4), not just this suite.
-                if walk_for_fatal_io(&e) {
-                    warn!(mirror = %mirror.name, %suite, err = %e, "suite failed with fatal I/O — bailing mirror");
-                    return Err(EngineError::Apt(e));
-                }
-                warn!(mirror = %mirror.name, %suite, err = %e, "suite failed — skipping publish");
-                if overrides.dry_run {
-                    dry_run_suites.push(SuiteDryRun {
-                        suite: suite.clone(),
-                        verdict: apt_flow::SuiteVerdict::Failed(e.to_string()),
-                        indexes_would_download: vec![],
-                        pool_would_download: vec![],
-                        pool_already_present: 0,
-                        bytes_estimate: 0,
-                        gc_candidates: None,
-                    });
-                } else {
-                    failed.push(suite.clone());
-                }
-            }
-        }
-    }
-
-    // Loaded only now so it isn't held through the pool phase.
-    let latest = load_manifest(&mirror_root, state.generation);
-    let untracked = if overrides.dry_run {
-        Vec::new()
-    } else {
-        let published = unchanged
-            .iter()
-            .chain(&failed)
-            .filter(|s| state.suites.contains_key(*s));
-        carry_forward(&mut new_manifest, latest.as_ref(), published)
+    let cfg = ClientConfig {
+        http1_only: base.http1_only || mirror.force_http1,
+        ..base
     };
+    build_client(&cfg).map_err(EngineError::Client)
+}
+
+/// Carry the published entries of suites that did not update this round
+/// into the next manifest. Returns the suites with nothing to carry.
+fn carry_forward_phase(
+    run: &MirrorRun<'_>,
+    suites: &mut SuiteResults,
+    state: &MirrorState,
+    latest: Option<&manifest::GenerationManifest>,
+) -> Vec<String> {
+    if run.overrides.dry_run {
+        return Vec::new();
+    }
+    let published = suites
+        .unchanged
+        .iter()
+        .chain(&suites.failed)
+        .filter(|s| state.suites.contains_key(*s));
+    let untracked = carry_forward(&mut suites.manifest, latest, published);
     if !untracked.is_empty() {
-        warn!(mirror = %mirror.name, suites = ?untracked, "published files of these suites are not in the manifest");
+        warn!(mirror = %run.mirror.name, suites = ?untracked, "published files of these suites are not in the manifest");
     }
+    untracked
+}
 
-    // Failure neutrality: persist only when some suite was updated, or when a
-    // quiet round drops entries (e.g. a suite removed from config).
-    let any_progress = !succeeded.is_empty() || !unchanged.is_empty();
-    let manifest_changed = latest
-        .as_ref()
-        .is_none_or(|l| l.files != new_manifest.files);
-    let persist = !overrides.dry_run
-        && (!succeeded.is_empty()
-            || (!unchanged.is_empty() && untracked.is_empty() && manifest_changed));
-    if persist {
-        state.generation = new_manifest.generation;
-        manifest::save(&mirror_root, &new_manifest).map_err(EngineError::Manifest)?;
-        state::save(&mirror_root, &state).map_err(EngineError::State)?;
-        debug!(
-            mirror = %mirror.name,
-            generation = new_manifest.generation,
-            files = new_manifest.len(),
-            "state + manifest written"
-        );
-        // GC references only the newest `keep_generations`; older ones are dead weight.
-        if let Err(e) = manifest::prune(&mirror_root, mirror.gc.keep_generations as usize) {
-            warn!(mirror = %mirror.name, %e, "pruning old manifests failed (non-fatal)");
-        }
+/// Save the next generation's manifest and state, then prune old
+/// manifests. Returns whether a generation was written.
+fn persist_generation(
+    run: &MirrorRun<'_>,
+    state: &mut MirrorState,
+    suites: &SuiteResults,
+    latest: Option<&manifest::GenerationManifest>,
+    untracked: &[String],
+) -> Result<bool, EngineError> {
+    // Failure neutrality: persist only when some suite was updated, or when
+    // a quiet round drops entries (e.g. a suite removed from config).
+    let new_manifest = &suites.manifest;
+    let manifest_changed = latest.is_none_or(|l| l.files != new_manifest.files);
+    let persist = !run.overrides.dry_run
+        && (!suites.succeeded.is_empty()
+            || (!suites.unchanged.is_empty() && untracked.is_empty() && manifest_changed));
+    if !persist {
+        return Ok(false);
     }
+    state.generation = new_manifest.generation;
+    manifest::save(run.root, new_manifest).map_err(EngineError::Manifest)?;
+    state::save(run.root, state).map_err(EngineError::State)?;
+    debug!(
+        mirror = %run.mirror.name,
+        generation = new_manifest.generation,
+        files = new_manifest.len(),
+        "state + manifest written"
+    );
+    // GC references only the newest `keep_generations`; older ones are dead weight.
+    if let Err(e) = manifest::prune(run.root, run.mirror.gc.keep_generations as usize) {
+        warn!(mirror = %run.mirror.name, %e, "pruning old manifests failed (non-fatal)");
+    }
+    Ok(true)
+}
 
+/// Run GC unless this round's manifest is incomplete. `None` when skipped
+/// or failed.
+fn run_gc_phase(
+    run: &MirrorRun<'_>,
+    suites: &SuiteResults,
+    untracked: &[String],
+    is_migration_boot: bool,
+) -> Option<gc::GcResult> {
+    let mirror = run.mirror;
     // GC also runs on unchanged-only rounds, else idle mirrors accumulate
     // old generations forever. A failed or untracked suite means an
     // incomplete manifest, so live GC is skipped.
-    let _ = global;
-    let mut gc_result = None;
-    let should_run_gc = if overrides.dry_run {
+    let should_run_gc = if run.overrides.dry_run {
         // Preview only: nothing is deleted, so the failure gate doesn't apply.
-        !dry_run_suites.is_empty()
+        !suites.dry_run.is_empty()
     } else {
-        failed.is_empty() && untracked.is_empty() && any_progress
+        suites.failed.is_empty() && untracked.is_empty() && suites.any_progress()
     };
-    if should_run_gc {
-        let opts = gc::GcOptions {
-            enabled: mirror.gc.enabled,
-            grace_period: mirror.gc.grace_period,
-            max_delete_ratio: mirror.gc.max_delete_ratio.as_f64(),
-            max_delete_byte_ratio: mirror.gc.max_delete_ratio.as_f64(),
-            keep_generations: mirror.gc.keep_generations,
-            // On migration boot the fresh manifest is unverified against the
-            // legacy layout; a live delete could remove still-wanted files.
-            dry_run: mirror.gc.dry_run
-                || overrides.gc_dry_run
-                || is_migration_boot
-                || overrides.dry_run,
-        };
-        match gc::run_gc(&mirror_root, &opts, std::time::SystemTime::now()) {
-            Ok(r) => {
-                info!(
-                    mirror = %mirror.name,
-                    scanned = r.scanned,
-                    referenced = r.referenced,
-                    candidates = r.candidates.len(),
-                    deleted = r.deleted.len(),
-                    skipped_grace = r.skipped_grace,
-                    circuit_broken = r.circuit_broken,
-                    disabled = r.disabled,
-                    dry_run = r.dry_run,
-                    "gc pass complete"
-                );
-                if r.circuit_broken {
-                    warn!(
-                        mirror = %mirror.name,
-                        candidates = ?r.candidates,
-                        reason = ?r.circuit_reason,
-                        "gc circuit broken — full candidate list logged"
-                    );
-                }
-                gc_result = Some(r);
-            }
-            Err(e) => {
-                warn!(mirror = %mirror.name, %e, "gc pass failed (non-fatal)");
-            }
+    if !should_run_gc {
+        if !suites.failed.is_empty() || !untracked.is_empty() {
+            info!(mirror = %mirror.name, "gc skipped — manifest incomplete this round");
         }
-    } else if !failed.is_empty() || !untracked.is_empty() {
-        info!(mirror = %mirror.name, "gc skipped — manifest incomplete this round");
+        return None;
     }
-
-    let (pool_files, pool_bytes) = if persist {
-        pool_totals(&new_manifest)
-    } else {
-        standing_pool_totals(&mirror_root, latest.as_ref())
+    let opts = gc::GcOptions {
+        enabled: mirror.gc.enabled,
+        grace_period: mirror.gc.grace_period,
+        max_delete_ratio: mirror.gc.max_delete_ratio.as_f64(),
+        max_delete_byte_ratio: mirror.gc.max_delete_ratio.as_f64(),
+        keep_generations: mirror.gc.keep_generations,
+        // On migration boot the fresh manifest is unverified against the
+        // legacy layout; a live delete could remove still-wanted files.
+        dry_run: mirror.gc.dry_run
+            || run.overrides.gc_dry_run
+            || is_migration_boot
+            || run.overrides.dry_run,
     };
+    match gc::run_gc(run.root, &opts, std::time::SystemTime::now()) {
+        Ok(r) => {
+            log_gc_result(&mirror.name, &r);
+            Some(r)
+        }
+        Err(e) => {
+            warn!(mirror = %mirror.name, %e, "gc pass failed (non-fatal)");
+            None
+        }
+    }
+}
 
-    // Same signal as `tain status`; failed suites keep their prior date_raw.
-    let last_success_unix = state
+fn log_gc_result(mirror: &str, r: &gc::GcResult) {
+    info!(
+        mirror = %mirror,
+        scanned = r.scanned,
+        referenced = r.referenced,
+        candidates = r.candidates.len(),
+        deleted = r.deleted.len(),
+        skipped_grace = r.skipped_grace,
+        circuit_broken = r.circuit_broken,
+        disabled = r.disabled,
+        dry_run = r.dry_run,
+        "gc pass complete"
+    );
+    if r.circuit_broken {
+        warn!(
+            mirror = %mirror,
+            candidates = ?r.candidates,
+            reason = ?r.circuit_reason,
+            "gc circuit broken — full candidate list logged"
+        );
+    }
+}
+
+/// The `--dry-run` report with the GC preview folded into every suite
+/// plan, after wiping the staging the planner used. `None` outside a dry
+/// run.
+fn dry_run_report(
+    run: &MirrorRun<'_>,
+    plans: Vec<SuiteDryRun>,
+    gc: Option<&gc::GcResult>,
+) -> Option<DryRunReport> {
+    if !run.overrides.dry_run {
+        return None;
+    }
+    // Index bytes fetched for planning (also by a suite that failed
+    // mid-plan) must not linger; nothing else lives there in a dry run
+    // worth keeping.
+    let staging = run.root.join(".tain/staging");
+    if let Err(e) = std::fs::remove_dir_all(&staging)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %staging.display(), %e, "failed to remove dry-run staging");
+    }
+    let gc_preview = gc.map(|g| GcPreview {
+        candidates: g.candidates.len(),
+        candidate_bytes: g.candidate_bytes,
+        circuit_broken: g.circuit_broken,
+    });
+    let suites = plans
+        .into_iter()
+        .map(|sd| SuiteDryRun {
+            gc_candidates: gc_preview.clone().or(sd.gc_candidates),
+            ..sd
+        })
+        .collect();
+    Some(DryRunReport {
+        mirror: run.mirror.name.clone(),
+        suites,
+    })
+}
+
+/// Assemble the outcome: standing pool totals and the last-success signal.
+fn build_outcome(
+    run: &MirrorRun<'_>,
+    suites: SuiteResults,
+    state: &MirrorState,
+    persisted: bool,
+    latest: Option<&manifest::GenerationManifest>,
+    gc: Option<gc::GcResult>,
+    dry_run: Option<DryRunReport>,
+) -> MirrorOutcome {
+    let (pool_files, pool_bytes) = if persisted {
+        pool_totals(&suites.manifest)
+    } else {
+        standing_pool_totals(run.root, latest)
+    };
+    MirrorOutcome {
+        mirror_name: run.mirror.name.clone(),
+        suites_succeeded: suites.succeeded,
+        suites_failed: suites.failed,
+        suites_unchanged: suites.unchanged,
+        new_generation: state.generation,
+        gc,
+        sync_duration: run.started.elapsed(),
+        pool_files,
+        pool_bytes,
+        last_success_unix: last_success_unix(state),
+        pgp_by_suite: suites.pgp_by_suite,
+        dry_run,
+    }
+}
+
+/// Max upstream Release `Date` across suites. Same signal as `tain
+/// status`; failed suites keep their prior `date_raw`.
+fn last_success_unix(state: &MirrorState) -> Option<i64> {
+    state
         .suites
         .values()
         .filter_map(|s| s.date_raw.as_deref())
@@ -398,54 +474,7 @@ pub async fn sync_mirror_with_budget(
                 .ok()
                 .map(|dt| dt.unix_timestamp())
         })
-        .max();
-
-    let dry_run_report = if overrides.dry_run {
-        // Index bytes fetched for planning (also by a suite that failed
-        // mid-plan) must not linger; nothing else lives there in a dry run
-        // worth keeping.
-        let staging = mirror_root.join(".tain/staging");
-        if let Err(e) = std::fs::remove_dir_all(&staging)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %staging.display(), %e, "failed to remove dry-run staging");
-        }
-        let gc_preview = gc_result.as_ref().map(|g| apt_flow::GcPreview {
-            candidates: g.candidates.len(),
-            candidate_bytes: g.candidate_bytes,
-            circuit_broken: g.circuit_broken,
-        });
-        let suites = dry_run_suites
-            .into_iter()
-            .map(|mut sd| {
-                if let Some(preview) = gc_preview.clone() {
-                    sd.gc_candidates = Some(preview);
-                }
-                sd
-            })
-            .collect();
-        Some(DryRunReport {
-            mirror: mirror.name.clone(),
-            suites,
-        })
-    } else {
-        None
-    };
-
-    Ok(MirrorOutcome {
-        mirror_name: mirror.name.clone(),
-        suites_succeeded: succeeded,
-        suites_failed: failed,
-        suites_unchanged: unchanged,
-        new_generation: state.generation,
-        gc: gc_result,
-        sync_duration: sync_started_at.elapsed(),
-        pool_files,
-        pool_bytes,
-        last_success_unix,
-        pgp_by_suite,
-        dry_run: dry_run_report,
-    })
+        .max()
 }
 
 /// The manifest `state.json` points at, if any.
@@ -466,37 +495,6 @@ fn next_generation(mirror_root: &Path, state_generation: u64) -> u64 {
         .and_then(|g| g.last().copied())
         .unwrap_or(0);
     state_generation.max(on_disk) + 1
-}
-
-/// A published suite the current manifest doesn't attribute (older
-/// manifest, lost entry) syncs as if new so its files get recorded
-/// exactly. `date_raw` stays for Date monotonicity.
-fn resync_if_unattributed(
-    prior: SuiteState,
-    suite: &str,
-    attributed: &std::collections::BTreeSet<String>,
-) -> SuiteState {
-    if prior.token_sha256.is_empty() || attributed.contains(suite) {
-        return prior;
-    }
-    info!(%suite, "suite not attributed in the manifest — re-syncing to record its files");
-    SuiteState {
-        token_sha256: String::new(),
-        etag: None,
-        last_modified: None,
-        ..prior
-    }
-}
-
-/// Attribute freshly synced `entries` and their by-hash objects to `suite`.
-fn record_suite(
-    m: &mut manifest::GenerationManifest,
-    mirror_root: &Path,
-    suite: &str,
-    entries: Vec<manifest::ManifestEntry>,
-) {
-    let objects = by_hash::published_objects(mirror_root, &entries);
-    m.attribute(suite, entries.into_iter().chain(objects));
 }
 
 /// Carry each suite's attributed entries from `latest` unchanged (its
@@ -743,5 +741,48 @@ mod tests {
     #[test]
     fn does_not_classify_generic_broken_pipe() {
         assert!(!is_fatal_io(&wrap_io(std::io::ErrorKind::BrokenPipe)));
+    }
+
+    fn manifest_with(generation: u64, rel_path: &str) -> manifest::GenerationManifest {
+        let mut m = manifest::GenerationManifest::new(generation);
+        m.attribute(
+            "stable",
+            [manifest::ManifestEntry {
+                rel_path: rel_path.to_owned(),
+                size: 1,
+                sha256_hex: Some("00".repeat(32)),
+                sha512_hex: None,
+            }],
+        );
+        m
+    }
+
+    #[test]
+    fn published_manifest_is_the_generation_state_points_at() {
+        let root = std::env::temp_dir().join(format!("tain-published-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let older = manifest_with(3, "pool/main/a.deb");
+        let newer = manifest_with(4, "pool/main/b.deb");
+        manifest::save(&root, &older).unwrap();
+        manifest::save(&root, &newer).unwrap();
+
+        assert_eq!(load_manifest(&root, 3), Some(older));
+        assert_eq!(load_manifest(&root, 4), Some(newer));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn no_published_manifest_without_a_loadable_generation() {
+        let root = std::env::temp_dir().join(format!("tain-unpublished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        manifest::save(&root, &manifest_with(1, "pool/main/a.deb")).unwrap();
+
+        assert_eq!(
+            load_manifest(&root, 0),
+            None,
+            "generation 0 means nothing published"
+        );
+        assert_eq!(load_manifest(&root, 2), None, "missing manifest file");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
