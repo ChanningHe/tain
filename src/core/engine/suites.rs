@@ -8,7 +8,8 @@ use tracing::{info, warn};
 use super::apt_flow::{
     AptFlowError, ApttSyncOutcome, FetchTuning, SuiteDryRun, SuiteVerdict, sync_apt_suite,
 };
-use super::{EngineError, MirrorRun, by_hash, next_generation, walk_for_fatal_io};
+use super::fatal_io::walk_for_fatal_io;
+use super::{EngineError, MirrorRun, by_hash, next_generation};
 use crate::backends::apt::pgp::VerifyOutcome as PgpVerifyOutcome;
 use crate::config::model::BackendOptions;
 use crate::core::store::manifest::{self, GenerationManifest, ManifestEntry};

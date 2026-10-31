@@ -11,6 +11,7 @@ mod hex;
 mod installer_current;
 mod pool_download;
 mod pool_fence;
+mod pool_phase;
 mod root_fetch;
 mod root_files;
 mod round;
@@ -18,7 +19,7 @@ mod stage;
 
 pub use dry_run::{DryRunReport, GcPreview, PoolPlan, SuiteDryRun, SuiteVerdict};
 pub use pool_download::{FetchTuning, download_verified};
-pub(crate) use round::PENDING_DIR;
+pub(crate) use pool_phase::PENDING_DIR;
 
 use std::path::{Path, PathBuf};
 
