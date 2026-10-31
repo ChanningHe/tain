@@ -3,16 +3,14 @@ set -eu
 
 [ "$1" = "remove" ] || exit 0
 
+# Stop only. The enable state survives remove and is kept on reinstall, but
+# units are not started again until the next boot or a manual start; postrm
+# drops the enable state on purge.
 if [ -d /run/systemd/system ]; then
     systemctl stop tain-sync.timer 2>/dev/null || true
     systemctl stop tain-sync.service 2>/dev/null || true
     systemctl stop tain-daemon.service 2>/dev/null || true
     systemctl stop 'tain@*.service' 2>/dev/null || true
-fi
-# disable also works offline (chroot, image build), so only needs systemctl.
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable tain-sync.timer 2>/dev/null || true
-    systemctl disable tain-daemon.service 2>/dev/null || true
 fi
 
 exit 0

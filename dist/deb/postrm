@@ -11,6 +11,11 @@ case "$1" in
         # mirror data is owned by them, and deleting the account would let a
         # later account reuse the UID/GID and own (or modify) that data.
         # See https://wiki.debian.org/AccountHandlingInMaintainerScripts.
+        # Drop the enable state that remove kept. disable removes the now
+        # dangling links and works offline (chroot, image build) too.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable tain-sync.timer tain-daemon.service >/dev/null 2>&1 || true
+        fi
         ;;
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         ;;
