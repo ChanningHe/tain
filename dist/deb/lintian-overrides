@@ -1,0 +1,8 @@
+# Static musl build by design: one binary for every distribution release.
+tain: statically-linked-binary [usr/bin/tain]
+# Not built with debhelper; the scripts only call systemctl when systemd runs.
+tain: maintainer-script-calls-systemctl
+# Usage is in `tain --help` and /usr/share/doc/tain/.
+tain: no-manual-page [usr/bin/tain]
+# Not uploaded to Debian, so there is no ITP bug to close.
+tain: initial-upload-closes-no-bugs

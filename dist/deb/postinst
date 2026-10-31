@@ -51,7 +51,7 @@ fi
 
 # Fresh install only; upgrades stay quiet.
 if [ "${1:-}" = configure ] && [ -z "${2:-}" ] \
-    && { [ -x /bin/systemctl ] || [ -x /usr/bin/systemctl ]; }; then
+    && command -v systemctl >/dev/null 2>&1; then
     echo "tain: pick one of the two supported shapes:"
     echo "  systemctl enable --now tain-sync.timer     # systemd-managed cadence"
     echo "  systemctl enable --now tain-daemon.service # built-in croner scheduler"

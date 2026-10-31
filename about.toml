@@ -1,0 +1,26 @@
+# Generates THIRD-PARTY-LICENSES for the release artifacts:
+#   cargo about generate --frozen --fail about.hbs -o THIRD-PARTY-LICENSES
+# Release binaries are static musl builds with default features.
+accepted = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# tain itself (publish = false); its license is shipped as LICENSE.
+private = { ignore = true }
+
+# LICENSE also carries the license of the Go code it derives from, which
+# pushes the match below the confidence threshold.
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"

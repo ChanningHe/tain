@@ -1,0 +1,17 @@
+Third-party software licenses
+=============================
+
+tain statically links the Rust crates listed below. Each section gives
+a license, the crates it applies to, and its full text.
+{{#each licenses}}
+
+--------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

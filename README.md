@@ -8,13 +8,14 @@ third-party repositories such as Proxmox) in sync with upstream.
 ## Install
 
 Every [release](https://github.com/channinghe/tain/releases) ships static
-Linux binaries (amd64, arm64), a `.deb` for amd64 and container images.
+Linux binaries, `.deb` packages and container images, each for amd64 and
+arm64.
 
-**Debian/Ubuntu package (amd64).** Installs `/usr/bin/tain`, the systemd
+**Debian/Ubuntu package.** Installs `/usr/bin/tain`, the systemd
 units, a `tain` system user and a starter `/etc/tain/config.toml`:
 
 ```sh
-sudo apt install ./tain_*_amd64.deb
+sudo apt install ./tain_*_"$(dpkg --print-architecture)".deb
 ```
 
 **Tarball.** Pick `amd64` or `arm64`, check the download, and install the
@@ -29,7 +30,8 @@ tar xzf "tain-linux-$ARCH.tar.gz"
 sudo install -m 755 "tain-linux-$ARCH/tain" /usr/bin/tain
 ```
 
-The tarball also contains the systemd units; see
+The tarball also contains the systemd units and the configuration
+reference (`docs/configuration.md`); see
 [dist/systemd/README.md](dist/systemd/README.md) to set them up.
 
 **Container image.** `ghcr.io/channinghe/tain` for linux/amd64 and
@@ -152,3 +154,10 @@ tain sync --dry-run               # print what would be downloaded, publish noth
 ## License
 
 [MIT license](LICENSE)
+
+The binary statically links third-party Rust crates. Their licenses and
+notices ship as `THIRD-PARTY-LICENSES` in the tarball, in
+`/usr/share/doc/tain/` from the `.deb` and in `/usr/share/licenses/tain/`
+in the container image.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).

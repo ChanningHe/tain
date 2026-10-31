@@ -1,5 +1,6 @@
 # Release image: packages binaries already built by the release workflow.
-# Build context layout: amd64/tain, arm64/tain, data/ (empty).
+# Build context (.github/scripts/image-context.sh): amd64/tain, arm64/tain,
+# licenses/ (LICENSE, THIRD-PARTY-LICENSES), data/ (empty).
 # distroless static: CA certificates and tzdata, no shell, runs as uid 65532.
 # VARIANT=debug adds busybox (`docker exec -it <ctr> sh`); published as *-debug tags.
 ARG VARIANT=release
@@ -11,7 +12,13 @@ FROM gcr.io/distroless/static-debian13:debug-nonroot@sha256:2a581fcbda6320d4d17f
 FROM base-${VARIANT}
 ARG TARGETARCH
 
+LABEL org.opencontainers.image.title="tain" \
+      org.opencontainers.image.description="APT repository mirror sync (tain)" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/channinghe/tain"
+
 COPY ${TARGETARCH}/tain /usr/local/bin/tain
+COPY licenses /usr/share/licenses/tain
 # Owned by nonroot so a fresh named volume is writable; bind mounts keep host ownership.
 COPY --chown=65532:65532 data /data
 VOLUME ["/data"]

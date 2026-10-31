@@ -4,6 +4,7 @@ version = "0.1.1"
 edition = "2024"
 rust-version = "1.96"
 description = "General-purpose repository mirror sync framework"
+publish = false
 license = "MIT"
 repository = "https://github.com/channinghe/tain"
 authors = ["ChanningHe"]
@@ -89,7 +90,8 @@ strip = "symbols"
 # Runtime deps are minimal: the binary is static (musl + rustls).
 [package.metadata.deb]
 maintainer = "Channing He <channinghey@gmail.com>"
-copyright = "2026 Channing He"
+# DEP-5 copyright with the full MIT text.
+license-file = "dist/deb/copyright"
 extended-description = """\
 Tain is a general-purpose repository mirror sync framework written in
 Rust. APT is the supported backend. See README.md for the operator
@@ -107,7 +109,10 @@ assets = [
     ["dist/systemd/README.md",           "usr/share/doc/tain/systemd.md", "644"],
     ["docs/configuration.md",            "usr/share/doc/tain/CONFIGURATION.md", "644"],
     ["README.md",                        "usr/share/doc/tain/README.md", "644"],
+    ["dist/deb/lintian-overrides",       "usr/share/lintian/overrides/tain", "644"],
 ]
+# Release .debs also get THIRD-PARTY-LICENSES, changelog.Debian.gz and
+# md5sums from .github/scripts/deb-finalize.sh.
 maintainer-scripts = "dist/deb/"
 # No `conf-files`: /etc/tain/config.toml is not shipped; postinst creates it
 # and postrm removes it on purge.

@@ -42,7 +42,10 @@
         };
 
         commonPackages = with pkgs; [
+          # Release packaging: THIRD-PARTY-LICENSES and the .deb.
+          cargo-about
           cargo-audit
+          cargo-deb
           cargo-llvm-cov
           cargo-nextest
           cargo-zigbuild
