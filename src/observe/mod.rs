@@ -2,6 +2,7 @@
 //! Prometheus textfile metrics.
 
 pub mod metrics;
+pub mod untrusted;
 
 use std::io::{self, IsTerminal};
 use std::str::FromStr;

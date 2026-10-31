@@ -4,6 +4,7 @@
 use std::io::Cursor;
 
 use crate::core::types::DigestAlgo;
+use crate::observe::untrusted::quote_untrusted;
 
 use super::checksums::{ChecksumError, ReleaseChecksums};
 use super::deb822::{self, Deb822Reader};
@@ -25,6 +26,7 @@ pub struct ReleaseHeader {
     pub description: Option<String>,
 }
 
+/// Upstream text in fields is pre-rendered by [`quote_untrusted`].
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseParseError {
     #[error(transparent)]
@@ -33,11 +35,11 @@ pub enum ReleaseParseError {
     Empty,
     #[error("Release contains more than one paragraph")]
     ExtraParagraph,
-    #[error("checksum line for {path:?} is malformed: {snippet:?}")]
+    #[error("checksum line for {path} is malformed: {snippet}")]
     BadChecksumLine { path: String, snippet: String },
-    #[error("checksum size for {path:?} is not an integer: {value:?}")]
+    #[error("checksum size for {path} is not an integer: {value}")]
     BadChecksumSize { path: String, value: String },
-    #[error("checksum path for {path:?} fails safety check: {reason}")]
+    #[error("checksum path for {path} fails safety check: {reason}")]
     UnsafePath { path: String, reason: String },
     #[error(transparent)]
     Checksum(#[from] ChecksumError),
@@ -110,22 +112,22 @@ fn parse_checksum_block(
         let path = iter.next().unwrap_or("");
         if hex.is_empty() || size_str.is_empty() || path.is_empty() {
             return Err(ReleaseParseError::BadChecksumLine {
-                path: path.to_owned(),
-                snippet: line.to_owned(),
+                path: quote_untrusted(path),
+                snippet: quote_untrusted(line),
             });
         }
         // APT paths never contain whitespace.
         if iter.next().is_some() {
             return Err(ReleaseParseError::BadChecksumLine {
-                path: path.to_owned(),
-                snippet: line.to_owned(),
+                path: quote_untrusted(path),
+                snippet: quote_untrusted(line),
             });
         }
         let size = size_str
             .parse::<u64>()
             .map_err(|_| ReleaseParseError::BadChecksumSize {
-                path: path.to_owned(),
-                value: size_str.to_owned(),
+                path: quote_untrusted(path),
+                value: quote_untrusted(size_str),
             })?;
         validate_checksum_path(path)?;
         checksums.upsert(algo, hex, size, path)?;
@@ -137,13 +139,13 @@ fn parse_checksum_block(
 fn validate_checksum_path(path: &str) -> Result<(), ReleaseParseError> {
     if path.starts_with('/') {
         return Err(ReleaseParseError::UnsafePath {
-            path: path.to_owned(),
+            path: quote_untrusted(path),
             reason: "absolute path".into(),
         });
     }
     if path.split('/').any(|seg| seg == "..") {
         return Err(ReleaseParseError::UnsafePath {
-            path: path.to_owned(),
+            path: quote_untrusted(path),
             reason: "contains `..` component".into(),
         });
     }

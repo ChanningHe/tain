@@ -26,8 +26,13 @@ pub fn open_decompressed(path: &Path) -> io::Result<Box<dyn BufRead>> {
 ///
 /// # Errors
 ///
-/// I/O errors opening the file.
+/// I/O errors opening the file; reading past [`DECOMPRESS_MAX_BYTES`] of
+/// output fails with `Other`.
 pub fn open_with(path: &Path, compression: Compression) -> io::Result<Box<dyn BufRead>> {
+    open_capped(path, compression, DECOMPRESS_MAX_BYTES)
+}
+
+fn open_capped(path: &Path, compression: Compression, cap: u64) -> io::Result<Box<dyn BufRead>> {
     let file = File::open(path).map_err(|e| annotate(e, path))?;
     let reader = BufReader::with_capacity(64 * 1024, file);
     // Every concatenated stream / member is decoded (Ubuntu ships two-stream
@@ -35,12 +40,17 @@ pub fn open_with(path: &Path, compression: Compression) -> io::Result<Box<dyn Bu
     // all gzip members, so the entries parsed here are a superset of what
     // clients see: the pool closure can only grow. Trailing bytes that are
     // not a valid stream fail the index, where apt would ignore them.
-    Ok(match compression {
-        Compression::Xz => Box::new(BufReader::new(XzDecoder::new_multi_decoder(reader))),
-        Compression::Gz => Box::new(BufReader::new(MultiGzDecoder::new(reader))),
-        Compression::Bz2 => Box::new(BufReader::new(MultiBzDecoder::new(reader))),
+    let decoded: Box<dyn Read> = match compression {
+        Compression::Xz => Box::new(XzDecoder::new_multi_decoder(reader)),
+        Compression::Gz => Box::new(MultiGzDecoder::new(reader)),
+        Compression::Bz2 => Box::new(MultiBzDecoder::new(reader)),
         Compression::None => Box::new(reader),
-    })
+    };
+    Ok(Box::new(BufReader::new(Capped {
+        inner: decoded,
+        remaining: cap,
+        cap,
+    })))
 }
 
 fn annotate(err: io::Error, path: &Path) -> io::Error {
@@ -50,22 +60,45 @@ fn annotate(err: io::Error, path: &Path) -> io::Error {
 /// Decompression-bomb cap. Debian's largest indexes are ~200 MiB uncompressed.
 pub const DECOMPRESS_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Passes through at most `cap` bytes, then fails instead of reporting EOF
+/// when more output follows, so a truncated stream is never mistaken for a
+/// complete one.
+struct Capped<R> {
+    inner: R,
+    remaining: u64,
+    cap: u64,
+}
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::other(format!(
+                    "decompressed size exceeds {} bytes cap (possible compression bomb)",
+                    self.cap
+                ))),
+            };
+        }
+        let max = usize::try_from(self.remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let n = self.inner.read(&mut buf[..max])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Read a variant fully into memory, capped at [`DECOMPRESS_MAX_BYTES`].
 ///
 /// # Errors
 ///
 /// I/O or decoder errors, or `Other` when the output exceeds the cap.
 pub fn read_to_vec(path: &Path) -> io::Result<Vec<u8>> {
-    let r = open_decompressed(path)?;
-    let mut capped = r.take(DECOMPRESS_MAX_BYTES + 1);
     let mut out = Vec::new();
-    capped.read_to_end(&mut out)?;
-    if out.len() as u64 > DECOMPRESS_MAX_BYTES {
-        return Err(io::Error::other(format!(
-            "decompressed size exceeds {} bytes cap (possible compression bomb)",
-            DECOMPRESS_MAX_BYTES
-        )));
-    }
+    open_decompressed(path)?.read_to_end(&mut out)?;
     Ok(out)
 }
 
@@ -78,16 +111,12 @@ pub fn decompress_to_file(src: &Path, dest: &Path) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let r = open_decompressed(src)?;
-    let mut capped = r.take(DECOMPRESS_MAX_BYTES + 1);
+    let mut r = open_decompressed(src)?;
     let mut w = File::create(dest)?;
-    let written = io::copy(&mut capped, &mut w)?;
-    if written > DECOMPRESS_MAX_BYTES {
+    if let Err(e) = io::copy(&mut r, &mut w) {
+        drop(w);
         let _ = std::fs::remove_file(dest);
-        return Err(io::Error::other(format!(
-            "decompressed size exceeds {} bytes cap (possible compression bomb)",
-            DECOMPRESS_MAX_BYTES
-        )));
+        return Err(e);
     }
     Ok(())
 }
@@ -159,6 +188,39 @@ mod tests {
         assert_eq!(out, b"BZ body");
     }
 
+    fn xz_file(name: &str, plain: &[u8]) -> PathBuf {
+        let p = tmp(name);
+        let mut enc = xz2::write::XzEncoder::new(File::create(&p).unwrap(), 9);
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap();
+        p
+    }
+
+    #[test]
+    fn streaming_reader_fails_past_the_cap() {
+        // ~1 MiB of zeros compresses to a few hundred bytes.
+        let p = xz_file("Packages.xz", &vec![0u8; 1024 * 1024]);
+        assert!(std::fs::metadata(&p).unwrap().len() < 4096);
+        let mut out = Vec::new();
+        let err = open_capped(&p, Compression::Xz, 64 * 1024)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap_err();
+        assert!(err.to_string().contains("compression bomb"), "{err}");
+        assert!(out.len() <= 64 * 1024, "{} bytes", out.len());
+    }
+
+    #[test]
+    fn streaming_reader_accepts_output_exactly_at_the_cap() {
+        let p = xz_file("Packages.xz", b"0123456789");
+        let mut out = Vec::new();
+        open_capped(&p, Compression::Xz, 10)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"0123456789");
+    }
+
     #[test]
     fn concatenated_streams_are_read_to_the_end() {
         // Ubuntu ships Packages.xz with a trailing empty stream; a later
@@ -192,6 +254,17 @@ mod tests {
                 assert_eq!(out, [&b"first\n"[..], tail].concat(), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn plain_reader_is_capped_too() {
+        let p = tmp("Packages");
+        std::fs::write(&p, b"0123456789").unwrap();
+        let mut out = Vec::new();
+        let res = open_capped(&p, Compression::None, 9)
+            .unwrap()
+            .read_to_end(&mut out);
+        assert!(res.is_err());
     }
 
     #[test]

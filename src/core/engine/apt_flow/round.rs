@@ -642,7 +642,7 @@ fn parseable<'s, 'c>(
 fn parse_date(which: &'static str, raw: &str) -> Result<OffsetDateTime, AptFlowError> {
     parse_release_datetime(raw).map_err(|e| AptFlowError::BadDate {
         which,
-        raw: raw.to_owned(),
+        raw: crate::observe::untrusted::quote_untrusted(raw),
         msg: e.to_string(),
     })
 }

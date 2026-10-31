@@ -9,6 +9,7 @@ use crate::core::types::{
 use super::checksums::decode_hex;
 use super::deb822::Paragraph;
 use super::layout::{LayoutError, SuiteLayout};
+use crate::observe::untrusted::{clip_untrusted, quote_untrusted};
 
 /// Convert one `Sources` paragraph into every source pool `FileSpec` it references.
 ///
@@ -40,7 +41,7 @@ pub fn paragraph_to_sourcespecs(
 
     if table.is_empty() {
         return Err(SourceParseError::MissingChecksums {
-            package: package.to_owned(),
+            package: quote_untrusted(package),
         });
     }
 
@@ -48,31 +49,31 @@ pub fn paragraph_to_sourcespecs(
     for row in table.rows {
         if row.digests.is_empty() {
             return Err(SourceParseError::NoDigest {
-                package: package.to_owned(),
-                filename: row.filename,
+                package: quote_untrusted(package),
+                filename: quote_untrusted(&row.filename),
             });
         }
         if !allow_weak_hash && row.digests.all_weak() {
             return Err(SourceParseError::WeakDigestOnly {
-                package: package.to_owned(),
-                filename: row.filename,
+                package: quote_untrusted(package),
+                filename: quote_untrusted(&row.filename),
             });
         }
         let joined = format!("{}/{}", directory.trim_end_matches('/'), row.filename);
         let rel_path = layout
             .root_rel(&joined)
             .map_err(|e| SourceParseError::UnsafeFilename {
-                package: package.to_owned(),
-                path: joined.clone(),
-                reason: e.to_string(),
+                package: quote_untrusted(package),
+                path: quote_untrusted(&joined),
+                reason: clip_untrusted(&e.to_string()),
             })?;
         let url =
             layout
                 .root_url(&joined)
                 .map_err(|e: LayoutError| SourceParseError::UrlBuild {
-                    package: package.to_owned(),
-                    path: joined.clone(),
-                    reason: e.to_string(),
+                    package: quote_untrusted(package),
+                    path: quote_untrusted(&joined),
+                    reason: clip_untrusted(&e.to_string()),
                 })?;
         out.push(FileSpec {
             rel_path,
@@ -113,8 +114,8 @@ impl FileTable {
             if row.filename == filename {
                 if row.size != size {
                     return Err(SourceParseError::SizeConflict {
-                        package: package.to_owned(),
-                        filename: filename.to_owned(),
+                        package: quote_untrusted(package),
+                        filename: quote_untrusted(filename),
                         previous: row.size,
                         current: size,
                     });
@@ -122,8 +123,8 @@ impl FileTable {
                 row.digests
                     .push(digest)
                     .map_err(|dup| SourceParseError::ConflictingDigest {
-                        package: package.to_owned(),
-                        filename: filename.to_owned(),
+                        package: quote_untrusted(package),
+                        filename: quote_untrusted(filename),
                         algo: dup.algo,
                         existing: dup.existing,
                         incoming: dup.incoming,
@@ -135,8 +136,8 @@ impl FileTable {
         digests
             .push(digest)
             .map_err(|dup| SourceParseError::ConflictingDigest {
-                package: package.to_owned(),
-                filename: filename.to_owned(),
+                package: quote_untrusted(package),
+                filename: quote_untrusted(filename),
                 algo: dup.algo,
                 existing: dup.existing,
                 incoming: dup.incoming,
@@ -167,30 +168,30 @@ fn parse_block(
         let filename = iter.next().unwrap_or("");
         if hex.is_empty() || size_str.is_empty() || filename.is_empty() {
             return Err(SourceParseError::MalformedLine {
-                package: package.to_owned(),
-                snippet: line.to_owned(),
+                package: quote_untrusted(package),
+                snippet: quote_untrusted(line),
             });
         }
         if iter.next().is_some() {
             return Err(SourceParseError::MalformedLine {
-                package: package.to_owned(),
-                snippet: line.to_owned(),
+                package: quote_untrusted(package),
+                snippet: quote_untrusted(line),
             });
         }
         let size: u64 = size_str.parse().map_err(|_| SourceParseError::BadSize {
-            package: package.to_owned(),
-            value: size_str.to_owned(),
+            package: quote_untrusted(package),
+            value: quote_untrusted(size_str),
         })?;
         validate_filename(filename, package)?;
         let bytes = decode_hex(hex).ok_or_else(|| SourceParseError::BadHex {
-            package: package.to_owned(),
+            package: quote_untrusted(package),
             algo,
-            hex: hex.to_owned(),
+            hex: quote_untrusted(hex),
         })?;
         let digest = Digest::new(algo, bytes).map_err(|e| match e {
             DigestError::LengthMismatch { expected, got, .. } => {
                 SourceParseError::HexLengthMismatch {
-                    package: package.to_owned(),
+                    package: quote_untrusted(package),
                     algo,
                     expected,
                     got,
@@ -205,15 +206,15 @@ fn parse_block(
 fn validate_filename(filename: &str, package: &str) -> Result<(), SourceParseError> {
     if filename.contains('/') || filename.contains('\\') {
         return Err(SourceParseError::UnsafeFilename {
-            package: package.to_owned(),
-            path: filename.to_owned(),
+            package: quote_untrusted(package),
+            path: quote_untrusted(filename),
             reason: "filename may not contain path separators".into(),
         });
     }
     if filename == ".." || filename == "." || filename.is_empty() {
         return Err(SourceParseError::UnsafeFilename {
-            package: package.to_owned(),
-            path: filename.to_owned(),
+            package: quote_untrusted(package),
+            path: quote_untrusted(filename),
             reason: "traversal component".into(),
         });
     }
@@ -231,54 +232,55 @@ fn required_str<'a>(
         .ok_or(SourceParseError::MissingField { field })
 }
 
+/// Upstream text in fields is pre-rendered by [`quote_untrusted`].
 #[derive(Debug, thiserror::Error)]
 pub enum SourceParseError {
     #[error("Sources paragraph is missing required field `{field}`")]
     MissingField { field: &'static str },
     #[error("Sources paragraph advertises no checksum block (Checksums-Sha256 is mandatory)")]
     MissingChecksums { package: String },
-    #[error("package {package:?}: file {filename:?}: no digest recorded")]
+    #[error("package {package}: file {filename}: no digest recorded")]
     NoDigest { package: String, filename: String },
-    #[error("package {package:?}: file {filename:?}: only weak digests (rejected by policy)")]
+    #[error("package {package}: file {filename}: only weak digests (rejected by policy)")]
     WeakDigestOnly { package: String, filename: String },
-    #[error("package {package:?}: malformed checksum line {snippet:?}")]
+    #[error("package {package}: malformed checksum line {snippet}")]
     MalformedLine { package: String, snippet: String },
-    #[error("package {package:?}: Size {value:?} is not a valid u64")]
+    #[error("package {package}: Size {value} is not a valid u64")]
     BadSize { package: String, value: String },
-    #[error("package {package:?}: {algo:?} digest {hex:?} is not valid hex")]
+    #[error("package {package}: {algo:?} digest {hex} is not valid hex")]
     BadHex {
         package: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("package {package:?}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
+    #[error("package {package}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         package: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("package {package:?}: file {filename:?} size conflicts: {previous} vs {current}")]
+    #[error("package {package}: file {filename} size conflicts: {previous} vs {current}")]
     SizeConflict {
         package: String,
         filename: String,
         previous: u64,
         current: u64,
     },
-    #[error("package {package:?}: path {path:?} is unsafe ({reason})")]
+    #[error("package {package}: path {path} is unsafe ({reason})")]
     UnsafeFilename {
         package: String,
         path: String,
         reason: String,
     },
-    #[error("package {package:?}: cannot build URL for {path:?} ({reason})")]
+    #[error("package {package}: cannot build URL for {path} ({reason})")]
     UrlBuild {
         package: String,
         path: String,
         reason: String,
     },
     #[error(
-        "package {package:?}: file {filename:?}: conflicting {algo:?} digest existing {existing} vs incoming {incoming}"
+        "package {package}: file {filename}: conflicting {algo:?} digest existing {existing} vs incoming {incoming}"
     )]
     ConflictingDigest {
         package: String,
@@ -293,8 +295,8 @@ impl From<DuplicateDigest> for SourceParseError {
     /// For a bare `DigestSet::push` with no package/filename in scope.
     fn from(dup: DuplicateDigest) -> Self {
         Self::ConflictingDigest {
-            package: String::new(),
-            filename: String::new(),
+            package: quote_untrusted(""),
+            filename: quote_untrusted(""),
             algo: dup.algo,
             existing: dup.existing,
             incoming: dup.incoming,

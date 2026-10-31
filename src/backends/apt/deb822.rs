@@ -3,8 +3,14 @@
 
 use std::io::{self, BufRead};
 
+use crate::observe::untrusted::quote_untrusted;
+
 /// Per-line byte cap against hostile upstreams; real lines stay well under 1 MiB.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-paragraph byte cap, so continuation lines cannot grow one value
+/// without bound; real paragraphs stay well under 1 MiB.
+pub const MAX_PARAGRAPH_BYTES: usize = 64 * 1024 * 1024;
 
 /// One deb822 paragraph. Field lookup is case-insensitive, as in apt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,10 +124,18 @@ impl<R: BufRead> Deb822Reader<R> {
         let mut fields: Vec<(String, String)> = Vec::new();
         let mut current: Option<(String, String)> = None;
         let mut line = first;
+        let mut paragraph_bytes = 0usize;
 
         loop {
             if line.text.is_empty() {
                 break;
+            }
+            paragraph_bytes = paragraph_bytes.saturating_add(line.text.len() + 1);
+            if paragraph_bytes > MAX_PARAGRAPH_BYTES {
+                return Err(ParseError::ParagraphTooLong {
+                    line: start_line,
+                    limit: MAX_PARAGRAPH_BYTES,
+                });
             }
             if line.text.starts_with('#') {
                 // Comment lines are dropped without breaking continuation.
@@ -175,7 +189,19 @@ impl<R: BufRead> Deb822Reader<R> {
             }
             let ch = match byte[0] {
                 b'\n' => break,
-                b'\r' => continue,
+                // As in apt, CR only counts as part of a line terminator.
+                b'\r' => match self.reader.fill_buf().map_err(ParseError::Io)?.first() {
+                    None => break,
+                    Some(b'\n') => {
+                        self.reader.consume(1);
+                        break;
+                    }
+                    Some(_) => {
+                        return Err(ParseError::StrayCarriageReturn {
+                            line: self.line_no + 1,
+                        });
+                    }
+                },
                 b if b.is_ascii() => b as char,
                 _ => {
                     // Non-UTF-8 input is rejected here.
@@ -252,12 +278,12 @@ fn is_continuation(line: &str) -> bool {
 fn parse_header(line: &str, line_no: usize) -> Result<(String, String), ParseError> {
     let colon = line.find(':').ok_or_else(|| ParseError::MissingColon {
         line: line_no,
-        snippet: line.to_owned(),
+        snippet: quote_untrusted(line),
     })?;
     let name = &line[..colon];
     validate_field_name(name).map_err(|reason| ParseError::MalformedFieldName {
         line: line_no,
-        name: name.to_owned(),
+        name: quote_untrusted(name),
         reason,
     })?;
     // deb822: one optional SP/HT after `:`; further whitespace belongs to the value.
@@ -284,9 +310,10 @@ fn validate_field_name(name: &str) -> Result<(), FieldNameProblem> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("line {line}: field header has no `:`: {snippet:?}")]
+    /// `snippet` and `name` hold [`quote_untrusted`] renderings.
+    #[error("line {line}: field header has no `:`: {snippet}")]
     MissingColon { line: usize, snippet: String },
-    #[error("line {line}: field name {name:?} is invalid ({reason})")]
+    #[error("line {line}: field name {name} is invalid ({reason})")]
     MalformedFieldName {
         line: usize,
         name: String,
@@ -296,6 +323,10 @@ pub enum ParseError {
     ContinuationWithoutField { line: usize },
     #[error("line {line}: exceeds maximum line length ({limit} bytes)")]
     LineTooLong { line: usize, limit: usize },
+    #[error("line {line}: paragraph exceeds maximum size ({limit} bytes)")]
+    ParagraphTooLong { line: usize, limit: usize },
+    #[error("line {line}: carriage return inside a line")]
+    StrayCarriageReturn { line: usize },
     #[error("line {line}: input is not valid UTF-8")]
     InvalidUtf8 { line: usize },
     #[error("I/O: {0}")]
@@ -603,6 +634,94 @@ SHA256:
             .unwrap_err()
             .to_string();
         assert!(!err.contains('\x1b'), "{err}");
+    }
+
+    #[test]
+    fn error_messages_are_bounded() {
+        let line = format!("no colon {}\n", "x".repeat(1024 * 1024));
+        let err = Deb822Reader::new(Cursor::new(line))
+            .read_paragraph()
+            .unwrap_err()
+            .to_string();
+        assert!(err.len() < 1024, "{} bytes", err.len());
+    }
+
+    #[test]
+    fn interior_carriage_return_rejected() {
+        for input in [
+            "Filename: pool/a\rb.deb\n",
+            "Package: a\r\r\n",
+            "\rPackage: a\n",
+        ] {
+            let res = Deb822Reader::new(Cursor::new(input)).read_paragraph();
+            assert!(
+                matches!(res, Err(ParseError::StrayCarriageReturn { line: 1 })),
+                "{input:?}: {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn carriage_return_before_eof_stripped() {
+        let p = parse_all("Package: a\r");
+        assert_eq!(p[0].get("Package"), Some("a"));
+    }
+
+    /// One `Description:` paragraph streamed lazily, never ending in a blank line.
+    struct EndlessParagraph {
+        header_sent: bool,
+        line: Vec<u8>,
+        pos: usize,
+    }
+
+    impl io::Read for EndlessParagraph {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = {
+                let avail = self.fill_buf()?;
+                let n = avail.len().min(buf.len());
+                buf[..n].copy_from_slice(&avail[..n]);
+                n
+            };
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for EndlessParagraph {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if !self.header_sent {
+                return Ok(b"Description: x\n");
+            }
+            Ok(&self.line[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            if !self.header_sent {
+                self.header_sent = true;
+                return;
+            }
+            self.pos = (self.pos + amt) % self.line.len();
+        }
+    }
+
+    #[test]
+    fn paragraph_past_ceiling_rejected() {
+        let mut line = vec![b'x'; 64 * 1024];
+        line[0] = b' ';
+        *line.last_mut().unwrap() = b'\n';
+        let src = EndlessParagraph {
+            header_sent: false,
+            line,
+            pos: 0,
+        };
+        // Bounded so a missing cap fails the test instead of exhausting memory.
+        let capped = io::Read::take(src, (MAX_PARAGRAPH_BYTES + MAX_PARAGRAPH_BYTES / 2) as u64);
+        let res = Deb822Reader::new(io::BufReader::new(capped)).read_paragraph();
+        assert!(
+            matches!(res, Err(ParseError::ParagraphTooLong { line: 1, .. })),
+            "{:?}",
+            res.map(|p| p.map(|p| p.get("Description").map(str::len)))
+        );
     }
 
     #[test]

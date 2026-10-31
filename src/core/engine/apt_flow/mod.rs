@@ -491,6 +491,7 @@ pub enum AptFlowError {
         "suite `{suite}`: upstream InRelease is not clearsigned although verify.pgp is on — refusing it (apt rejects an unsigned InRelease)"
     )]
     UnsignedInRelease { suite: String },
+    /// `examples` joins quoted, clipped package names.
     #[error(
         "{index}: {count} entr{plural} carry only MD5/SHA-1 digests (e.g. {examples}) — they would stay listed in the published index but be missing from pool; set verify.allow_weak_hash = true to mirror them",
         plural = if *count == 1 { "y" } else { "ies" }
@@ -545,7 +546,8 @@ pub enum AptFlowError {
         #[source]
         source: Box<AptFlowError>,
     },
-    #[error("bad {which} field `{raw}`: {msg}")]
+    /// `raw` is a [`crate::observe::untrusted::quote_untrusted`] rendering.
+    #[error("bad {which} field {raw}: {msg}")]
     BadDate {
         which: &'static str,
         raw: String,

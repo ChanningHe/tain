@@ -168,6 +168,44 @@ mod tests {
     }
 
     #[test]
+    fn weak_only_examples_are_escaped_and_bounded() {
+        let path = std::env::temp_dir().join(format!(
+            "tain-weak-examples-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let name = format!("\x1b[31mevil{}", "x".repeat(1024 * 1024));
+        let packages = (0..7)
+            .map(|_| {
+                format!(
+                    "Package: {name}\nFilename: pool/e.deb\nSize: 1\nMD5sum: {}\n\n",
+                    "3".repeat(32)
+                )
+            })
+            .collect::<String>();
+        std::fs::write(&path, packages).unwrap();
+        let base = url::Url::parse("https://deb.example.org/debian").unwrap();
+        let layout = SuiteLayout::new(&base, "bookworm");
+
+        let err = parse_packages_into(
+            &path,
+            "main/binary-amd64/Packages",
+            Compression::None,
+            &layout,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        let msg = err.to_string();
+        assert!(msg.contains("7 entries"), "{msg}");
+        assert!(!msg.contains('\x1b'), "{msg}");
+        assert!(msg.contains("\\u{1b}[31mevil"), "{msg}");
+        assert!(msg.len() < 4096, "{} bytes", msg.len());
+    }
+
+    #[test]
     fn no_weak_entries_is_ok() {
         assert!(WeakOnly::default().into_result("x").is_ok());
     }

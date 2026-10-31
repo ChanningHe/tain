@@ -5,6 +5,7 @@ use crate::core::types::{Digest, DigestAlgo, DigestError, DigestSet, FileSpec, L
 
 use super::deb822::Paragraph;
 use super::layout::{LayoutError, SuiteLayout};
+use crate::observe::untrusted::{clip_untrusted, quote_untrusted};
 
 /// Convert one `Packages` paragraph into a `FileSpec`.
 ///
@@ -24,15 +25,15 @@ pub fn paragraph_to_filespec(
     let rel_path = layout
         .root_rel(filename)
         .map_err(|e| PackageParseError::UnsafeFilename {
-            package: package.to_owned(),
-            filename: filename.to_owned(),
-            reason: e.to_string(),
+            package: quote_untrusted(package),
+            filename: quote_untrusted(filename),
+            reason: clip_untrusted(&e.to_string()),
         })?;
 
     let size_str = required_str(paragraph, "Size")?;
     let size: u64 = size_str.parse().map_err(|_| PackageParseError::BadSize {
-        package: package.to_owned(),
-        value: size_str.to_owned(),
+        package: quote_untrusted(package),
+        value: quote_untrusted(size_str),
     })?;
 
     let mut digests = DigestSet::new();
@@ -55,21 +56,21 @@ pub fn paragraph_to_filespec(
 
     if digests.is_empty() {
         return Err(PackageParseError::NoDigest {
-            package: package.to_owned(),
+            package: quote_untrusted(package),
         });
     }
     if !allow_weak_hash && digests.all_weak() {
         return Err(PackageParseError::WeakDigestOnly {
-            package: package.to_owned(),
+            package: quote_untrusted(package),
         });
     }
 
     let url = layout
         .root_url(filename)
         .map_err(|e: LayoutError| PackageParseError::UrlBuild {
-            package: package.to_owned(),
-            filename: filename.to_owned(),
-            reason: e.to_string(),
+            package: quote_untrusted(package),
+            filename: quote_untrusted(filename),
+            reason: clip_untrusted(&e.to_string()),
         })?;
 
     Ok(FileSpec {
@@ -109,13 +110,13 @@ fn parse_optional_checksum(
         return Ok(());
     };
     let bytes = super::checksums::decode_hex(hex).ok_or_else(|| PackageParseError::BadHex {
-        package: package.to_owned(),
+        package: quote_untrusted(package),
         algo,
-        hex: hex.to_owned(),
+        hex: quote_untrusted(hex),
     })?;
     let digest = Digest::new(algo, bytes).map_err(|e| match e {
         DigestError::LengthMismatch { expected, got, .. } => PackageParseError::HexLengthMismatch {
-            package: package.to_owned(),
+            package: quote_untrusted(package),
             algo,
             expected,
             got,
@@ -127,40 +128,41 @@ fn parse_optional_checksum(
     Ok(())
 }
 
+/// Upstream text in fields is pre-rendered by [`quote_untrusted`].
 #[derive(Debug, thiserror::Error)]
 pub enum PackageParseError {
     #[error("Packages paragraph is missing required field `{field}`")]
     MissingField { field: &'static str },
-    #[error("package {package:?}: Filename {filename:?} is unsafe ({reason})")]
+    #[error("package {package}: Filename {filename} is unsafe ({reason})")]
     UnsafeFilename {
         package: String,
         filename: String,
         reason: String,
     },
-    #[error("package {package:?}: cannot build pool URL for {filename:?} ({reason})")]
+    #[error("package {package}: cannot build pool URL for {filename} ({reason})")]
     UrlBuild {
         package: String,
         filename: String,
         reason: String,
     },
-    #[error("package {package:?}: Size {value:?} is not a valid u64")]
+    #[error("package {package}: Size {value} is not a valid u64")]
     BadSize { package: String, value: String },
-    #[error("package {package:?}: {algo:?} digest {hex:?} is not valid hex")]
+    #[error("package {package}: {algo:?} digest {hex} is not valid hex")]
     BadHex {
         package: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("package {package:?}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
+    #[error("package {package}: {algo:?} digest length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         package: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("package {package:?}: no digest fields (SHA512/SHA256/SHA1/MD5sum) present")]
+    #[error("package {package}: no digest fields (SHA512/SHA256/SHA1/MD5sum) present")]
     NoDigest { package: String },
-    #[error("package {package:?}: only weak digests (SHA-1 / MD5) — rejected by policy")]
+    #[error("package {package}: only weak digests (SHA-1 / MD5) — rejected by policy")]
     WeakDigestOnly { package: String },
 }
 

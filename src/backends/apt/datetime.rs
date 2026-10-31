@@ -26,15 +26,25 @@ pub fn parse_release_datetime(s: &str) -> Result<OffsetDateTime, DateParseError>
     if s.len() > MAX_DATE_LEN {
         return Err(DateParseError::TooLong { len: s.len() });
     }
-    let normalized: Vec<String> = s.split_whitespace().map(normalize_token).collect();
+    let mut seen_day = false;
+    let normalized: Vec<String> = s
+        .split_whitespace()
+        .map(|tok| {
+            // The first all-digit token is the day; a later one is the year.
+            let is_day = !seen_day && tok.bytes().all(|b| b.is_ascii_digit());
+            seen_day |= is_day;
+            normalize_token(tok, is_day)
+        })
+        .collect();
     Ok(OffsetDateTime::parse(&normalized.join(" "), &Rfc2822)?)
 }
 
 /// Bring apt-accepted variants into `time`'s strict RFC 2822 shape: Launchpad
 /// writes `Sat, 24 Oct 2026  6:20:18 UTC` (space-padded day/hour, runs of
 /// spaces, which `split_whitespace` already folds), and `UTC`/`GMT` zones are
-/// common.
-fn normalize_token(tok: &str) -> String {
+/// common. Only the day and the time fields are zero-padded; the year stays
+/// verbatim, so `6` is never read as 2006.
+fn normalize_token(tok: &str, is_day: bool) -> String {
     let zero_pad = |part: &str| {
         if part.len() == 1 && part.as_bytes()[0].is_ascii_digit() {
             format!("0{part}")
@@ -45,7 +55,8 @@ fn normalize_token(tok: &str) -> String {
     match tok {
         "UTC" | "GMT" => "+0000".to_owned(),
         _ if tok.contains(':') => tok.split(':').map(zero_pad).collect::<Vec<_>>().join(":"),
-        _ => zero_pad(tok),
+        _ if is_day => zero_pad(tok),
+        _ => tok.to_owned(),
     }
 }
 
@@ -94,6 +105,24 @@ mod tests {
         );
         assert_eq!(
             parse_release_datetime("Sun, 4 Oct 2026 6:05:09 +0000").unwrap(),
+            datetime!(2026-10-04 06:05:09 UTC)
+        );
+    }
+
+    #[test]
+    fn single_digit_year_is_not_zero_padded() {
+        // apt reads `6` as year 6, never 2006.
+        let parsed = parse_release_datetime("Sat, 03 Feb 6 09:15:38 UTC");
+        assert!(
+            parsed.as_ref().map_or(true, |dt| dt.year() != 2006),
+            "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn day_is_padded_without_a_weekday() {
+        assert_eq!(
+            parse_release_datetime("4 Oct 2026 6:05:09 UTC").unwrap(),
             datetime!(2026-10-04 06:05:09 UTC)
         );
     }
