@@ -16,7 +16,7 @@ use crate::backends::apt::installer_sums::parse_installer_sums;
 use crate::backends::apt::layout::SuiteLayout;
 use crate::backends::apt::packages::{PackageParseError, paragraph_to_filespec};
 use crate::backends::apt::sources::{SourceParseError, paragraph_to_sourcespecs};
-use crate::core::types::FileSpec;
+use crate::core::types::{DigestSet, FileSpec};
 
 use super::AptFlowError;
 
@@ -190,8 +190,31 @@ pub(super) fn dedupe_by_path(
     Ok(by_path.into_values().map(|(spec, _)| spec).collect())
 }
 
+fn algos(set: &DigestSet) -> Vec<u8> {
+    let mut out: Vec<u8> = set.iter().map(|d| d.algo.strength()).collect();
+    out.sort_unstable();
+    out
+}
+
 /// Fold `other`'s size and digests into `kept`; `Err` describes the clash.
 fn merge_spec(kept: &mut FileSpec, other: &FileSpec) -> Result<(), String> {
+    // Agreement on a shared digest proves both entries name the same bytes
+    // only if that digest is the best one the weaker entry offers: disjoint
+    // sets (SHA256 here, SHA512 there) may describe different files, and
+    // later checks verify only part of a merged set. A weak floor must
+    // cover everything: reuse checks only SHA256, so a weak-only entry
+    // merged into a stronger one would never have its digest checked.
+    let floor = match (kept.digests.strongest(), other.digests.strongest()) {
+        (Some(a), Some(b)) if a.algo.strength() <= b.algo.strength() => a.algo,
+        (Some(_), Some(b)) => b.algo,
+        _ => return Err("missing digests".to_owned()),
+    };
+    if kept.digests.get(floor).is_none() || other.digests.get(floor).is_none() {
+        return Err(format!("digests: no common {floor:?} digest"));
+    }
+    if floor.is_weak() && algos(&kept.digests) != algos(&other.digests) {
+        return Err(format!("digests: only a weak {floor:?} digest in common"));
+    }
     match (kept.size, other.size) {
         (Some(a), Some(b)) if a != b => return Err(format!("size {a} vs {b}")),
         (None, Some(b)) => kept.size = Some(b),
@@ -208,7 +231,7 @@ fn merge_spec(kept: &mut FileSpec, other: &FileSpec) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{Digest, DigestAlgo, DigestSet, Layer, RelPath};
+    use crate::core::types::{Digest, DigestAlgo, Layer, RelPath};
 
     fn spec(path: &str, size: Option<u64>, digests: &[(DigestAlgo, u8)]) -> FileSpec {
         let mut set = DigestSet::new();
@@ -249,12 +272,59 @@ mod tests {
     #[test]
     fn merged_entry_keeps_every_digest_and_the_known_size() {
         let a = spec("pool/a.deb", None, &[(DigestAlgo::Sha256, 1)]);
-        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha512, 2)]);
+        let b = spec(
+            "pool/a.deb",
+            Some(4),
+            &[(DigestAlgo::Sha256, 1), (DigestAlgo::Sha512, 2)],
+        );
         let out = dedupe_by_path(vec![a, b], &origins()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].size, Some(4));
         assert!(out[0].digests.get(DigestAlgo::Sha256).is_some());
         assert!(out[0].digests.get(DigestAlgo::Sha512).is_some());
+    }
+
+    #[test]
+    fn disjoint_strong_digests_are_a_conflict() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha512, 2)]);
+        let err = dedupe_by_path(vec![a, b], &origins()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no common Sha256 digest"), "{msg}");
+        assert!(
+            msg.contains("amd64/Packages") && msg.contains("arm64/Packages"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn strong_entry_without_the_weak_entrys_digest_is_a_conflict() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Md5, 1)]);
+        let err = dedupe_by_path(vec![a, b], &origins()).unwrap_err();
+        assert!(err.to_string().contains("no common Md5 digest"), "{err}");
+    }
+
+    #[test]
+    fn weak_only_entries_with_the_same_digests_merge() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Md5, 3)]);
+        let out = dedupe_by_path(vec![a.clone(), a.clone()], &origins()).unwrap();
+        assert_eq!(out, vec![a]);
+    }
+
+    #[test]
+    fn weak_only_entry_does_not_merge_into_a_stronger_one() {
+        let a = spec(
+            "pool/a.deb",
+            Some(4),
+            &[(DigestAlgo::Sha256, 1), (DigestAlgo::Md5, 3)],
+        );
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Md5, 3)]);
+        let err = dedupe_by_path(vec![a, b], &origins()).unwrap_err();
+        assert!(
+            err.to_string().contains("only a weak Md5 digest in common"),
+            "{err}"
+        );
     }
 
     #[test]

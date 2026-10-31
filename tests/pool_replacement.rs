@@ -472,6 +472,128 @@ async fn conflicting_entries_within_one_suite_fail_it() {
     assert!(!root.join("dists").join(SUITE).exists(), "suite published");
 }
 
+/// Publish raw `Packages` bodies (one per architecture) under `date`.
+fn write_raw_indexes(serve: &Path, date: &str, listed: &[(String, Vec<u8>)]) {
+    let dists = serve.join("dists").join(SUITE);
+    for (path, bytes) in listed {
+        write_file(&dists.join(path), bytes);
+    }
+    let release = release_body(date, &["amd64", "arm64"], listed);
+    write_file(&dists.join("Release"), &release);
+    write_file(&dists.join("InRelease"), &release);
+}
+
+#[tokio::test]
+async fn disjoint_digests_for_one_path_fail_the_suite() {
+    let serve = TempDir::new("pool-disjoint-serve");
+    let target = TempDir::new("pool-disjoint-target");
+    let a = deb("pkg", b"content A!");
+    write_file(&serve.path().join(a.filename()), &a.bytes);
+    let paragraph = |digest: String| {
+        format!(
+            "Package: pkg\nVersion: 1.0\nArchitecture: all\nFilename: {}\nSize: 10\n{digest}\n\n",
+            a.filename()
+        )
+        .into_bytes()
+    };
+    let amd64 = paragraph(format!("SHA256: {}", sha256_hex(&a.bytes)));
+    let packages = |arch: &str, body: Vec<u8>| (format!("main/binary-{arch}/Packages"), body);
+    write_raw_indexes(
+        serve.path(),
+        DATE_1,
+        &[
+            packages("amd64", amd64.clone()),
+            packages("arm64", Vec::new()),
+        ],
+    );
+    let (base, _up) = spawn_upstream(serve.path().to_path_buf()).await;
+    let global = build_global(target.path());
+    let mirror = build_mirror(base, &["amd64", "arm64"], false);
+    assert!(sync(&global, &mirror).await.is_success());
+
+    // arm64 now lists the same path by SHA512 only, of other bytes.
+    let arm64 = paragraph(format!("SHA512: {}", hex(&Sha512::digest(b"content B!"))));
+    write_raw_indexes(
+        serve.path(),
+        DATE_2,
+        &[packages("amd64", amd64), packages("arm64", arm64)],
+    );
+    let outcome = sync(&global, &mirror).await;
+    assert!(!outcome.is_success(), "{outcome:?}");
+
+    let root = target.path().join("m");
+    let published_arm64 = std::fs::read(
+        root.join("dists")
+            .join(SUITE)
+            .join("main/binary-arm64/Packages"),
+    )
+    .unwrap();
+    assert!(published_arm64.is_empty(), "conflicting index published");
+    assert_eq!(
+        on_disk_sha256(&root.join(a.filename())),
+        published_sha256(&root, "amd64", &a.filename())
+    );
+    assert_verify_clean(&root);
+}
+
+#[tokio::test]
+async fn weak_only_entry_sharing_only_md5_with_a_stronger_one_fails_the_suite() {
+    let serve = TempDir::new("pool-weak-merge-serve");
+    let target = TempDir::new("pool-weak-merge-target");
+    let a = deb("pkg", b"content A!");
+    write_file(&serve.path().join(a.filename()), &a.bytes);
+    let paragraph = |digests: &str| {
+        format!(
+            "Package: pkg\nVersion: 1.0\nArchitecture: all\nFilename: {}\nSize: 10\n{digests}\n\n",
+            a.filename()
+        )
+        .into_bytes()
+    };
+    let packages = |arch: &str, body: Vec<u8>| (format!("main/binary-{arch}/Packages"), body);
+    let sha256 = format!("SHA256: {}", sha256_hex(&a.bytes));
+    write_raw_indexes(
+        serve.path(),
+        DATE_1,
+        &[
+            packages("amd64", paragraph(&sha256)),
+            packages("arm64", Vec::new()),
+        ],
+    );
+    let (base, _up) = spawn_upstream(serve.path().to_path_buf()).await;
+    let global = build_global(target.path());
+    let mut mirror = build_mirror(base, &["amd64", "arm64"], false);
+    mirror.verify.allow_weak_hash = true;
+    assert!(sync(&global, &mirror).await.is_success());
+
+    // Both indexes agree on an MD5 that does not match the bytes; only
+    // amd64's SHA256 is right, and arm64 clients can check only the MD5.
+    let forged_md5 = "MD5sum: 0123456789abcdef0123456789abcdef";
+    write_raw_indexes(
+        serve.path(),
+        DATE_2,
+        &[
+            packages("amd64", paragraph(&format!("{sha256}\n{forged_md5}"))),
+            packages("arm64", paragraph(forged_md5)),
+        ],
+    );
+    let outcome = sync(&global, &mirror).await;
+    assert!(!outcome.is_success(), "{outcome:?}");
+
+    let root = target.path().join("m");
+    let published_arm64 = std::fs::read(
+        root.join("dists")
+            .join(SUITE)
+            .join("main/binary-arm64/Packages"),
+    )
+    .unwrap();
+    assert!(published_arm64.is_empty(), "forged index published");
+    assert_eq!(
+        on_disk_sha256(&root.join(a.filename())),
+        published_sha256(&root, "amd64", &a.filename())
+    );
+    assert_verify_clean(&root);
+}
+
 // ---------- recorded size ----------
 
 #[tokio::test]
