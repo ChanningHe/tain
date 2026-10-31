@@ -18,6 +18,7 @@ mod stage;
 
 pub use dry_run::{DryRunReport, GcPreview, PoolPlan, SuiteDryRun, SuiteVerdict};
 pub use pool_download::{FetchTuning, download_verified};
+pub(crate) use round::PENDING_DIR;
 
 use std::path::{Path, PathBuf};
 
@@ -585,6 +586,17 @@ pub enum AptFlowError {
     },
     #[error(transparent)]
     Publish(#[from] publish::PublishError),
+    /// Two index entries of one suite name the same pool file with
+    /// different content.
+    #[error(
+        "pool file {path:?} is listed by `{first}` and `{second}` with conflicting {detail} — refusing to sync this suite"
+    )]
+    PoolEntryConflict {
+        path: String,
+        first: String,
+        second: String,
+        detail: String,
+    },
 }
 
 impl From<Box<AptFlowError>> for AptFlowError {

@@ -167,8 +167,8 @@ pub(super) async fn classify_pool(
             sha256_hex: sha256,
         });
     }
+    // Already one spec per path: the wanted set is deduped upstream.
     plans.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    plans.dedup_by(|a, b| a.rel_path == b.rel_path);
     Ok((plans, already, bytes))
 }
 

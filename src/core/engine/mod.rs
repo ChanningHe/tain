@@ -585,9 +585,10 @@ fn walk_for_fatal_io(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Best-effort removal of `.tmp~` sidecars left by a crashed run: downloads
-/// under `pool/` and `dists/`, plus the state and manifest temp files
-/// directly in `.tain/` and `.tain/manifest/` (never inside `.tain/prev/`).
+/// Best-effort removal of what a crashed run left behind: `.tmp~` sidecars
+/// of downloads under `pool/` and `dists/`, the state and manifest temp
+/// files directly in `.tain/` and `.tain/manifest/` (never inside
+/// `.tain/prev/`), and pool replacements no round committed.
 fn sweep_tmp_sidecars(mirror_root: &Path) {
     for sub in ["pool", "dists"] {
         sweep_dir(&mirror_root.join(sub), true);
@@ -595,6 +596,12 @@ fn sweep_tmp_sidecars(mirror_root: &Path) {
     let state_dir = mirror_root.join(crate::core::store::STATE_DIR);
     sweep_dir(&state_dir, false);
     sweep_dir(&manifest::manifest_dir(mirror_root), false);
+    let pending = mirror_root.join(apt_flow::PENDING_DIR);
+    if let Err(e) = std::fs::remove_dir_all(&pending)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %pending.display(), %e, "failed to sweep pending pool replacements");
+    }
 }
 
 /// True when `mirror_root` holds anything besides `.tain` (migration guard).
@@ -670,6 +677,7 @@ mod tests {
             "dists/x/InRelease.tmp~",
             ".tain/state.json.tmp~",
             ".tain/manifest/7.json.tmp~",
+            ".tain/pending/pool/main/a.deb",
         ];
         let kept = [
             "pool/main/a.deb",

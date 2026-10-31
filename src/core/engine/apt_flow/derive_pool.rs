@@ -4,6 +4,8 @@
 //! byte fidelity forbids dropping them from the published index, and
 //! skipping their pool files would leave clients with 404s.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::io::BufReader;
 use std::path::Path;
 
@@ -149,9 +151,153 @@ pub(super) fn parse_packages_into(
     weak.into_result(index)
 }
 
+/// Collapse the wanted list to one spec per `rel_path` (an `arch: all`
+/// file appears in every architecture's Packages). `origins` names the
+/// index behind each run of `specs`: `(end, index)` covers every spec
+/// before `end` not covered by an earlier pair.
+///
+/// Entries for one path must agree on size and on every digest they share;
+/// their digests are merged. Disagreement means the suite contradicts
+/// itself, and no choice of bytes would satisfy both indexes.
+pub(super) fn dedupe_by_path(
+    specs: Vec<FileSpec>,
+    origins: &[(usize, String)],
+) -> Result<Vec<FileSpec>, AptFlowError> {
+    let mut by_path: BTreeMap<String, (FileSpec, usize)> = BTreeMap::new();
+    let mut origin = 0;
+    for (i, spec) in specs.into_iter().enumerate() {
+        while origins.get(origin).is_some_and(|(end, _)| *end <= i) {
+            origin += 1;
+        }
+        match by_path.entry(spec.rel_path.as_str().to_owned()) {
+            Entry::Vacant(slot) => {
+                slot.insert((spec, origin));
+            }
+            Entry::Occupied(mut slot) => {
+                let (kept, first) = slot.get_mut();
+                if let Err(detail) = merge_spec(kept, &spec) {
+                    let name = |o: usize| origins.get(o).map(|(_, n)| n.clone());
+                    return Err(AptFlowError::PoolEntryConflict {
+                        path: spec.rel_path.as_str().to_owned(),
+                        first: name(*first).unwrap_or_default(),
+                        second: name(origin).unwrap_or_default(),
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+    Ok(by_path.into_values().map(|(spec, _)| spec).collect())
+}
+
+/// Fold `other`'s size and digests into `kept`; `Err` describes the clash.
+fn merge_spec(kept: &mut FileSpec, other: &FileSpec) -> Result<(), String> {
+    match (kept.size, other.size) {
+        (Some(a), Some(b)) if a != b => return Err(format!("size {a} vs {b}")),
+        (None, Some(b)) => kept.size = Some(b),
+        _ => {}
+    }
+    for digest in other.digests.iter() {
+        kept.digests
+            .push(digest.clone())
+            .map_err(|e| format!("{:?} digest {} vs {}", e.algo, e.existing, e.incoming))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::types::{Digest, DigestAlgo, DigestSet, Layer, RelPath};
+
+    fn spec(path: &str, size: Option<u64>, digests: &[(DigestAlgo, u8)]) -> FileSpec {
+        let mut set = DigestSet::new();
+        for (algo, fill) in digests {
+            let len = match algo {
+                DigestAlgo::Md5 => 16,
+                DigestAlgo::Sha1 => 20,
+                DigestAlgo::Sha256 => 32,
+                DigestAlgo::Sha512 => 64,
+            };
+            set.push(Digest::new(*algo, vec![*fill; len]).unwrap())
+                .unwrap();
+        }
+        FileSpec {
+            rel_path: RelPath::new(path).unwrap(),
+            digests: set,
+            size,
+            url: url::Url::parse("http://up.example/")
+                .unwrap()
+                .join(path)
+                .unwrap(),
+            layer: Layer::Content,
+            immutable: true,
+        }
+    }
+
+    fn origins() -> Vec<(usize, String)> {
+        vec![(1, "amd64/Packages".into()), (2, "arm64/Packages".into())]
+    }
+
+    #[test]
+    fn identical_entries_from_two_indexes_collapse_to_one() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let out = dedupe_by_path(vec![a.clone(), a.clone()], &origins()).unwrap();
+        assert_eq!(out, vec![a]);
+    }
+
+    #[test]
+    fn merged_entry_keeps_every_digest_and_the_known_size() {
+        let a = spec("pool/a.deb", None, &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha512, 2)]);
+        let out = dedupe_by_path(vec![a, b], &origins()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].size, Some(4));
+        assert!(out[0].digests.get(DigestAlgo::Sha256).is_some());
+        assert!(out[0].digests.get(DigestAlgo::Sha512).is_some());
+    }
+
+    #[test]
+    fn output_is_sorted_by_path() {
+        let b = spec("pool/b.deb", Some(1), &[(DigestAlgo::Sha256, 1)]);
+        let a = spec("pool/a.deb", Some(1), &[(DigestAlgo::Sha256, 2)]);
+        let out = dedupe_by_path(vec![b, a], &origins()).unwrap();
+        let paths: Vec<&str> = out.iter().map(|s| s.rel_path.as_str()).collect();
+        assert_eq!(paths, ["pool/a.deb", "pool/b.deb"]);
+    }
+
+    #[test]
+    fn differing_digest_names_both_indexes() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 2)]);
+        let err = dedupe_by_path(vec![a, b], &origins()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pool/a.deb"), "{msg}");
+        assert!(msg.contains("amd64/Packages"), "{msg}");
+        assert!(msg.contains("arm64/Packages"), "{msg}");
+    }
+
+    #[test]
+    fn differing_size_is_a_conflict() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(5), &[(DigestAlgo::Sha256, 1)]);
+        let err = dedupe_by_path(vec![a, b], &origins()).unwrap_err();
+        assert!(err.to_string().contains("size 4 vs 5"), "{err}");
+    }
+
+    #[test]
+    fn conflict_inside_one_index_names_it_twice() {
+        let a = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 1)]);
+        let b = spec("pool/a.deb", Some(4), &[(DigestAlgo::Sha256, 2)]);
+        let err = dedupe_by_path(vec![a, b], &[(2, "main/Packages".into())]).unwrap_err();
+        let AptFlowError::PoolEntryConflict { first, second, .. } = err else {
+            panic!("{err}");
+        };
+        assert_eq!(
+            (first.as_str(), second.as_str()),
+            ("main/Packages", "main/Packages")
+        );
+    }
 
     #[test]
     fn weak_only_report_lists_a_bounded_sample() {

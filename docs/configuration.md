@@ -610,11 +610,14 @@ passes `tain check`; still, read it before use.
         lock                per-mirror lock
         manifest/           generation manifests: every file of every suite
         staging/            work area for the sync in progress
+        pending/            new content for existing pool files, moved into
+                            pool/ right before the suite is published
         prev/<suite>/<gen>/ previous copies of a suite's dists/ tree, removed by GC
 ```
 
-`staging/` sits inside the mirror root so that publishing a suite is a
-rename on one filesystem. Exclude `.tain/` from your web server.
+`staging/` and `pending/` sit inside the mirror root so that publishing a
+suite is a rename on one filesystem: `.tain/` must not be a separate mount
+from `dists/` and `pool/`. Exclude `.tain/` from your web server.
 
 ## Exit codes
 
