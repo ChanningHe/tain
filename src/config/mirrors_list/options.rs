@@ -74,14 +74,18 @@ pub(super) fn apply_arch_edits(base: &[String], edits: &[ArchEdit]) -> Vec<Strin
 pub(super) fn parse(inner: &str) -> Result<Options, String> {
     let mut opts = Options::default();
     for kv in inner.split(is_apt_space).filter(|s| !s.is_empty()) {
-        let malformed = || format!("options entry `{kv}` is not key=value");
-        let (k, v) = kv.split_once('=').ok_or_else(malformed)?;
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("options entry `{kv}` is not key=value"))?;
         let (key, modifier) = match k.strip_suffix(['+', '-']) {
             Some(base) => (base, k.chars().last()),
             None => (k, None),
         };
-        if key.is_empty() || v.is_empty() {
-            return Err(malformed());
+        if key.is_empty() {
+            return Err(format!("options entry `{kv}` has no key"));
+        }
+        if v.is_empty() {
+            return Err(format!("options entry `{kv}` has no value"));
         }
         match (key, modifier) {
             ("arch", None) => opts.arch = Some(split_list(kv, v)?),
@@ -191,5 +195,7 @@ mod tests {
         for text in ["arch", "=x", "arch=", "arch=,", "+=x"] {
             assert!(parse(text).is_err(), "{text}");
         }
+        assert!(parse("arch=").unwrap_err().contains("has no value"));
+        assert!(parse("=x").unwrap_err().contains("has no key"));
     }
 }

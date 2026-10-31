@@ -578,12 +578,17 @@ Options are handled as follows:
 - `arch=` sets the architectures; `arch+=` / `arch-=` edit the list from
   `arch=` or a `deb-<arch>` directive. With neither, they would edit
   apt's configured architectures, which the importer cannot see, so the
-  line is not converted.
+  line is not converted; neither is a line whose edits remove every
+  architecture.
 - `signed-by=` becomes `verify.pgp = "required"` with that keyring when
   it is one absolute path. Key fingerprints, several keyrings and
   relative paths cannot become a keyring file, so the line is not
   converted: a mirror of it would not check signatures. In a build
   without OpenPGP support, no line with `signed-by=` is converted.
+  Without `signed-by=`, apt checks a line against its trusted keyring,
+  which tain does not use or guess: such a mirror gets `pgp = "off"`, a
+  comment explaining how to turn verification on, and one warning at the
+  end of the import lists all of them.
 - `lang`, `target` (also with `+=` / `-=`), `trusted`, `pdiffs`,
   `by-hash`, `check-valid-until`, `valid-until-min`, `valid-until-max`,
   `check-date`, `date-max-future`, `allow-insecure`, `allow-weak` and

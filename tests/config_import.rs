@@ -271,6 +271,66 @@ fn options_tain_cannot_honour_skip_only_their_line() {
 }
 
 #[test]
+fn arch_edits_that_remove_every_architecture_skip_the_line() {
+    let dir = TempDir::new("import-arch-empty");
+    let got = import_and_check(
+        &dir,
+        "deb [arch=amd64 arch-=amd64] http://x/a bookworm main\n\
+         deb-arm64 [arch-=arm64] http://x/b bookworm main\n\
+         deb [arch=arm64] http://x/c bookworm main\n",
+    );
+    assert_eq!(
+        values_of(&got.toml, "url"),
+        vec!["\"http://x/c\""],
+        "{}",
+        got.toml
+    );
+    assert!(!got.toml.contains("[defaults]"), "{}", got.toml);
+    for line in [1, 2] {
+        let needle = format!("line {line} not converted");
+        assert!(got.stderr.contains(&needle), "{needle}:\n{}", got.stderr);
+    }
+}
+
+/// apt would check these lines against its trusted keyring; tain cannot,
+/// so it says so instead of guessing a keyring.
+#[test]
+fn mirrors_without_signed_by_are_marked_unverified() {
+    let dir = TempDir::new("import-unverified");
+    let got = import_and_check(
+        &dir,
+        "deb http://x/a bookworm main\n\
+         deb http://x/b bookworm main\n",
+    );
+    assert_eq!(
+        got.toml.matches("# Signatures are not verified").count(),
+        2,
+        "{}",
+        got.toml
+    );
+    assert!(values_of(&got.toml, "keyring").is_empty(), "{}", got.toml);
+    let summary: Vec<&str> = got
+        .stderr
+        .lines()
+        .filter(|l| l.contains("do not verify signatures"))
+        .collect();
+    assert_eq!(summary.len(), 1, "{}", got.stderr);
+    assert!(summary[0].contains("`x-a`, `x-b`"), "{}", summary[0]);
+}
+
+#[cfg(feature = "pgp")]
+#[test]
+fn signed_mirrors_carry_no_unverified_note() {
+    let dir = TempDir::new("import-verified");
+    let got = import_and_check(
+        &dir,
+        "deb [signed-by=/etc/k.gpg] http://x/a bookworm main\n",
+    );
+    assert!(!got.toml.contains("not verified"), "{}", got.toml);
+    assert!(!got.stderr.contains("verify signatures"), "{}", got.stderr);
+}
+
+#[test]
 fn arch_edits_next_to_an_arch_list_are_applied() {
     let dir = TempDir::new("import-arch-edits");
     let got = import_and_check(

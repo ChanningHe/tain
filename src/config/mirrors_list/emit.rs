@@ -212,7 +212,8 @@ pub fn convert(entries: &[Entry]) -> Conversion {
     let paths = mirror_paths::resolve(entries, &urls, &names);
     let notes = shared_url_notes(&groups, &names);
     let dropped: Vec<String> = debs.iter().flat_map(|d| dropped_parts(d)).collect();
-    let warnings = collect_warnings(entries, &paths, &dropped, &notes);
+    let mut warnings = collect_warnings(entries, &paths, &dropped, &notes);
+    warnings.extend(unverified_warning(&groups, &names));
 
     let any_no_arch = groups.iter().any(|g| g.architectures().is_none());
     let mut out = String::new();
@@ -291,12 +292,45 @@ fn write_mirror(
         writeln!(out, "sources = true").unwrap();
     }
     // `skip_reason` lets only a usable keyring through, and none without pgp.
-    if let Some(kr) = &g.keyring {
-        writeln!(out, "[mirror.verify]").unwrap();
-        writeln!(out, "pgp = \"required\"").unwrap();
-        writeln!(out, "keyring = {}", toml_string(&kr.to_string_lossy())).unwrap();
+    match &g.keyring {
+        Some(kr) => {
+            writeln!(out, "[mirror.verify]").unwrap();
+            writeln!(out, "pgp = \"required\"").unwrap();
+            writeln!(out, "keyring = {}", toml_string(&kr.to_string_lossy())).unwrap();
+        }
+        None => {
+            writeln!(out, "# {UNVERIFIED}").unwrap();
+            writeln!(out, "# {ENABLE_VERIFY}").unwrap();
+        }
     }
     out.push('\n');
+}
+
+/// Comment on a mirror without `signed-by`; tain never guesses a keyring.
+const UNVERIFIED: &str = "Signatures are not verified: the source lines have no signed-by, \
+                          and apt's trusted keyring is not used by tain.";
+
+const ENABLE_VERIFY: &str = if cfg!(feature = "pgp") {
+    "To verify them, add [mirror.verify] with pgp = \"required\" and keyring = \"/path/to/keyring.gpg\"."
+} else {
+    "Verifying them needs a tain build with OpenPGP support."
+};
+
+/// One warning naming every mirror that will not verify signatures.
+fn unverified_warning(groups: &[Group], names: &[String]) -> Option<String> {
+    let unverified: Vec<String> = groups
+        .iter()
+        .zip(names)
+        .filter(|(g, _)| g.keyring.is_none())
+        .map(|(_, name)| format!("`{name}`"))
+        .collect();
+    (!unverified.is_empty()).then(|| {
+        format!(
+            "mirrors {} do not verify signatures because their lines have no signed-by; \
+             set verify.keyring and verify.pgp = \"required\" on each to verify them",
+            unverified.join(", ")
+        )
+    })
 }
 
 /// Every message the TOML carries as a comment, for stderr; a shared-URL

@@ -105,12 +105,18 @@ pub fn parse_line(line_no: usize, raw: &str) -> Result<Option<Entry>, ImportErro
         .arch
         .or(arch_override_from_head)
         .map(|base| options::apply_arch_edits(&base, &opts.arch_edits));
-    if arch_override.is_none() && !opts.arch_edits.is_empty() {
-        opts.unsupported.get_or_insert_with(|| {
+    let arch_problem = match &arch_override {
+        None if !opts.arch_edits.is_empty() => Some(
             "`arch+=` / `arch-=` edit apt's configured architectures, which the importer \
-             cannot see; list them with `arch=`"
-                .to_owned()
-        });
+             cannot see; list them with `arch=`",
+        ),
+        Some(archs) if archs.is_empty() => {
+            Some("`arch-=` removes every architecture, which leaves nothing to mirror")
+        }
+        _ => None,
+    };
+    if let Some(why) = arch_problem {
+        opts.unsupported.get_or_insert_with(|| why.to_owned());
     }
 
     if tokens.len() < 2 {
