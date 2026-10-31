@@ -207,6 +207,7 @@ fn open_mirror(
         lock::LockError::Contended { .. } => EngineError::LockContended(e),
         other => EngineError::Lock(other),
     })?;
+    check_same_filesystem(&root)?;
     let (state, is_migration_boot) = load_state(&root, mirror)?;
     Ok(OpenMirror {
         root,
@@ -214,6 +215,43 @@ fn open_mirror(
         is_migration_boot,
         _lock: lock,
     })
+}
+
+/// Staged suites and pending pool replacements are moved out of `.tain/`
+/// by rename, so `dists/` and `pool/` must live on its filesystem. Checked
+/// up front: otherwise every publish or content change fails with EXDEV.
+#[cfg(unix)]
+fn check_same_filesystem(mirror_root: &Path) -> Result<(), EngineError> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |path: &Path| std::fs::metadata(path).map(|m| m.dev());
+    let tain = mirror_root.join(crate::core::store::STATE_DIR);
+    let tain_dev = dev(&tain).map_err(|e| EngineError::Io {
+        path: tain.clone(),
+        source: e,
+    })?;
+    // The root itself catches a separately mounted `.tain` before the
+    // first run has created `dists/` or `pool/`.
+    let paths = [
+        mirror_root.to_path_buf(),
+        mirror_root.join("dists"),
+        mirror_root.join("pool"),
+    ];
+    for path in paths {
+        match dev(&path) {
+            Ok(d) if d != tain_dev => {
+                return Err(EngineError::SplitFilesystem { tain, other: path });
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(EngineError::Io { path, source: e }),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_same_filesystem(_mirror_root: &Path) -> Result<(), EngineError> {
+    Ok(())
 }
 
 /// The mirror's state and whether this is a migration boot.
@@ -563,6 +601,10 @@ pub enum EngineError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "`{other}` is on a different filesystem from `{tain}` — tain publishes by rename, so both must share one filesystem (do not mount or symlink them separately)"
+    )]
+    SplitFilesystem { tain: PathBuf, other: PathBuf },
 }
 
 /// True for fatal local I/O (disk full, quota, unwritable target), which
@@ -667,6 +709,68 @@ fn is_fatal_io_kind(io: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_dir(base: &Path, tag: &str) -> PathBuf {
+        let dir = base.join(format!("tain-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn same_filesystem_layout_passes_the_check() {
+        let root = fresh_dir(&std::env::temp_dir(), "samefs");
+        for sub in [".tain", "dists", "pool"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        assert!(check_same_filesystem(&root).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_on_another_filesystem_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let elsewhere = Path::new("/dev/shm");
+        let root = fresh_dir(&std::env::temp_dir(), "splitfs");
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        if dev(elsewhere).is_none() || dev(elsewhere) == dev(&root) {
+            std::fs::remove_dir_all(&root).unwrap();
+            return; // no second filesystem to test against
+        }
+        let pool = fresh_dir(elsewhere, "splitfs-pool");
+        std::fs::create_dir_all(root.join(".tain")).unwrap();
+        std::os::unix::fs::symlink(&pool, root.join("pool")).unwrap();
+        let err = check_same_filesystem(&root).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::SplitFilesystem { other, .. } if other.ends_with("pool")),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&pool).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separately_mounted_state_dir_is_refused_before_the_first_run() {
+        use std::os::unix::fs::MetadataExt;
+        let elsewhere = Path::new("/dev/shm");
+        let root = fresh_dir(&std::env::temp_dir(), "splitfs-root");
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        if dev(elsewhere).is_none() || dev(elsewhere) == dev(&root) {
+            std::fs::remove_dir_all(&root).unwrap();
+            return; // no second filesystem to test against
+        }
+        let tain = fresh_dir(elsewhere, "splitfs-tain");
+        std::os::unix::fs::symlink(&tain, root.join(".tain")).unwrap();
+        let err = check_same_filesystem(&root).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::SplitFilesystem { other, .. } if *other == root),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&tain).unwrap();
+    }
 
     #[test]
     fn sweep_removes_state_and_manifest_sidecars_too() {

@@ -617,7 +617,9 @@ passes `tain check`; still, read it before use.
 
 `staging/` and `pending/` sit inside the mirror root so that publishing a
 suite is a rename on one filesystem: `.tain/` must not be a separate mount
-from `dists/` and `pool/`. Exclude `.tain/` from your web server.
+from `dists/` and `pool/`, and neither may be a symlink to another
+filesystem. Each sync checks this before touching the mirror and fails it
+with an error naming both paths. Exclude `.tain/` from your web server.
 
 ## Exit codes
 

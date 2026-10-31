@@ -597,9 +597,13 @@ impl SuiteRun<'_> {
             };
             return Ok(PoolAction::Reuse { size });
         }
-        // Without a SHA256 the presence check cannot tell a changed file
-        // from an unchanged one, so every such file would be re-fetched
-        // through pending (twice the disk); overwrite in place instead.
+        // Known limitation: without a SHA256 the presence check cannot tell
+        // a changed file from an unchanged one, so every such file would be
+        // re-fetched through pending (twice the disk). These entries are
+        // still overwritten in place, and a later failure in the round can
+        // leave the published index disagreeing with them until the next
+        // success. Route them through pending once the presence check
+        // compares the strongest available digest.
         if spec.digests.get(DigestAlgo::Sha256).is_none() {
             return Ok(PoolAction::Download {
                 target: final_local,
