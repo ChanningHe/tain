@@ -150,7 +150,7 @@ fn check_rejects_suite_nested_inside_another_suite() {
 }
 
 #[test]
-fn check_accepts_sibling_suites_sharing_a_name_prefix() {
+fn check_rejects_nesting_even_among_prefix_sharing_siblings() {
     let out = check(
         "cv-siblings",
         "",
@@ -161,9 +161,12 @@ fn check_accepts_sibling_suites_sharing_a_name_prefix() {
             "",
         ),
     );
-    // `stable/updates` lies inside `stable`.
-    assert_config_error(&out, "inside suite");
+    // `stable/updates` lies inside `stable`; `stable-updates` does not.
+    assert_config_error(&out, "\"stable/updates\" lies inside suite \"stable\"");
+}
 
+#[test]
+fn check_accepts_sibling_suites_sharing_a_name_prefix() {
     let out = check(
         "cv-siblings-ok",
         "",
@@ -323,7 +326,70 @@ fn derived_mirror_name_fits_in_a_file_name() {
             &["check"],
         );
         assert_ok(&out);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix("name = \""))
+            .map(|l| l.trim_end_matches('"'))
+            .collect();
+        assert!(!names.is_empty(), "{stdout}");
+        for name in names {
+            assert!(name.len() <= 255, "{} bytes: {name}", name.len());
+            assert!(name.starts_with("127.0.0.1-seg-seg"), "{name}");
+        }
     }
+}
+
+#[test]
+fn non_unicode_tain_config_is_a_config_error() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tain"))
+        .env_clear()
+        .env(
+            "TAIN_CONFIG",
+            OsStr::from_bytes(b"/etc/tain/\xffconfig.toml"),
+        )
+        .env("TAIN_URL", URL)
+        .env("TAIN_DISTS", "bookworm|main|amd64")
+        .arg("check")
+        .output()
+        .expect("spawn tain");
+    assert_config_error(&out, "TAIN_CONFIG");
+}
+
+#[test]
+fn check_rejects_bad_scheme_without_echoing_credentials_or_query() {
+    let body =
+        default_mirror("").replace(URL, "ftp://user:pw-s3cr3t@127.0.0.1:1/debian?tok=s3cr3t");
+    let out = check("cv-scheme", "", &body);
+    assert_config_error(&out, "\"ftp\"");
+    assert!(!stderr(&out).contains("s3cr3t"), "{}", stderr(&out));
+}
+
+#[test]
+fn service_link_variables_do_not_warn() {
+    let dir = TempDir::new("cv-links");
+    let cfg = write_config(&dir, "", &default_mirror(""));
+    let out = run(
+        Some(&cfg),
+        &[
+            ("TAIN_PORT", "tcp://10.0.0.1:80"),
+            ("TAIN_PORT_80_TCP_PORT", "80"),
+            ("TAIN_SERVICE_HOST", "10.0.0.1"),
+        ],
+        &["check"],
+    );
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("WARN"), "{}", stderr(&out));
+}
+
+#[test]
+fn check_rejects_suite_part_too_long_for_its_files() {
+    let suite = format!("[\"bookworm/{}\"]", "x".repeat(200));
+    let out = check("cv-long-suite", "", &mirror("d", &suite, r#"["main"]"#, ""));
+    assert_config_error(&out, "longer than");
 }
 
 #[test]

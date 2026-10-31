@@ -639,8 +639,9 @@ pub enum ConfigError {
         inner: String,
         inner_path: PathBuf,
     },
-    #[error("mirror `{mirror}`: url `{url}` must use http or https")]
-    UnsupportedScheme { mirror: String, url: String },
+    // Only the scheme: the url may carry credentials or a token.
+    #[error("mirror `{mirror}`: url scheme {scheme:?} is not supported; use http or https")]
+    UnsupportedScheme { mirror: String, scheme: String },
     // The query may carry a token, so the message never echoes the URL.
     #[error(
         "mirror `{mirror}`: url must not have a query (`?...`) or fragment (`#...`); tain \
@@ -761,29 +762,57 @@ fn check_apt_fields(m: &MirrorConfig) -> Result<(), ConfigError> {
                 value: value.clone(),
             });
         }
-        if let Some(value) = values.iter().find(|v| !is_apt_value(v, is_suite)) {
+        let invalid = values
+            .iter()
+            .find_map(|v| apt_value_problem(v, is_suite).map(|reason| (v, reason)));
+        if let Some((value, reason)) = invalid {
             return Err(ConfigError::InvalidAptValue {
                 mirror: m.name.clone(),
                 field,
                 value: value.clone(),
-                reason: if is_suite {
-                    "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ - /`"
-                } else {
-                    "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ -`"
-                },
+                reason,
             });
         }
     }
     Ok(())
 }
 
+/// Longest `/`-separated part of a suite, component or architecture. Files
+/// such as `Contents-udeb-<arch>.gz` and tain's `~` sidecars extend these
+/// names, so they keep a margin below `MAX_FILE_NAME_BYTES`.
+pub const MAX_APT_SEGMENT_BYTES: usize = MAX_FILE_NAME_BYTES - 64;
+
 /// Whether `value` is a valid suite (`is_suite`), component or architecture:
-/// non-empty, from `[A-Za-z0-9._+~-]`, plus `/` in suites.
+/// non-empty, from `[A-Za-z0-9._+~-]` (plus `/` in suites), and no part
+/// longer than `MAX_APT_SEGMENT_BYTES`.
 #[must_use]
 pub fn is_apt_value(value: &str, is_suite: bool) -> bool {
+    apt_value_problem(value, is_suite).is_none()
+}
+
+fn apt_value_problem(value: &str, is_suite: bool) -> Option<&'static str> {
     let is_allowed =
         |c: char| c.is_ascii_alphanumeric() || "._+~-".contains(c) || (is_suite && c == '/');
-    !value.is_empty() && value.chars().all(is_allowed)
+    if !is_suite && value.ends_with("/debian-installer") {
+        return Some(
+            "is not a component; set `indexes.debian_installer = true` to mirror the \
+             installer indexes",
+        );
+    }
+    if value.is_empty() || !value.chars().all(is_allowed) {
+        return Some(if is_suite {
+            "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ - /`"
+        } else {
+            "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ -`"
+        });
+    }
+    if value
+        .split('/')
+        .any(|part| part.len() > MAX_APT_SEGMENT_BYTES)
+    {
+        return Some("has a part longer than 191 bytes");
+    }
+    None
 }
 
 /// Whether `url` has a non-empty query or fragment. Requests are built by
@@ -799,7 +828,7 @@ fn check_url(m: &MirrorConfig) -> Result<(), ConfigError> {
     if !matches!(m.url.scheme(), "http" | "https") {
         return Err(ConfigError::UnsupportedScheme {
             mirror: m.name.clone(),
-            url: m.url.to_string(),
+            scheme: m.url.scheme().to_owned(),
         });
     }
     if has_query_or_fragment(&m.url) {
@@ -1599,6 +1628,32 @@ mod tests {
             assert!(!is_apt_value(bad, true), "{bad}");
         }
         assert!(!is_apt_value("non/free", false));
+    }
+
+    #[test]
+    fn apt_values_limit_each_part_and_messages_match_the_limits() {
+        let part = "s".repeat(MAX_APT_SEGMENT_BYTES);
+        assert!(is_apt_value(&format!("{part}/{part}"), true));
+        let long = format!("{part}s");
+        assert!(!is_apt_value(&format!("ok/{long}"), true));
+        assert!(!is_apt_value(&long, false));
+        let reason = apt_value_problem(&long, false).unwrap();
+        assert!(
+            reason.contains(&MAX_APT_SEGMENT_BYTES.to_string()),
+            "{reason}"
+        );
+        let path = PathBuf::from("n".repeat(MAX_FILE_NAME_BYTES + 1));
+        let reason = normalize_mirror_path(&path).unwrap_err();
+        assert!(
+            reason.contains(&MAX_FILE_NAME_BYTES.to_string()),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn debian_installer_component_points_at_the_index_switch() {
+        let reason = apt_value_problem("main/debian-installer", false).unwrap();
+        assert!(reason.contains("indexes.debian_installer"), "{reason}");
     }
 
     #[test]

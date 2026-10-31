@@ -29,6 +29,12 @@ pub trait EnvSource {
     fn names(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Whether `key` is set to a value that is not valid UTF-8 (which `get`
+    /// reports as unset).
+    fn is_non_unicode(&self, _key: &str) -> bool {
+        false
+    }
 }
 
 impl EnvSource for HashMap<String, String> {
@@ -53,6 +59,10 @@ impl EnvSource for ProcessEnv {
         std::env::vars_os()
             .filter_map(|(k, _)| k.into_string().ok())
             .collect()
+    }
+
+    fn is_non_unicode(&self, key: &str) -> bool {
+        matches!(std::env::var(key), Err(std::env::VarError::NotUnicode(_)))
     }
 }
 
@@ -192,37 +202,66 @@ impl UnknownVar {
     }
 }
 
-/// Largest edit distance at which a known name is offered as a suggestion.
+/// Largest edit distance at which a known name is offered as a suggestion;
+/// shorter names allow less (one edit per three characters after `TAIN_`).
 const MAX_SUGGESTION_DISTANCE: usize = 3;
 
-/// `TAIN_*` names in `env` that tain does not read (legacy and removed names
-/// excepted: `detect_legacy` reports those), sorted.
-pub fn detect_unknown(env: &dyn EnvSource) -> Vec<UnknownVar> {
+/// Every variable tain reads, plus the removed ones `detect_legacy` reports.
+fn known_env_names() -> impl Iterator<Item = &'static str> {
     let removed = REMOVED_ENV_NAMES.iter().map(|&(name, _)| name);
-    let known: Vec<&'static str> = GLOBAL_ENV_NAMES
+    GLOBAL_ENV_NAMES
         .iter()
         .chain(SINGLE_SOURCE_ENV_NAMES)
         .copied()
         .chain(removed)
-        .collect();
+}
+
+/// Names that Kubernetes service links and docker `--link` inject for a
+/// service or container called `tain`; they are not meant for tain.
+fn is_injected_link_name(name: &str) -> bool {
+    name == "TAIN_PORT"
+        || name == "TAIN_NAME"
+        || ["TAIN_PORT_", "TAIN_SERVICE_", "TAIN_ENV_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// `TAIN_*` names in `env` that tain does not read, sorted. Removed names
+/// (reported by `detect_legacy`) and service-link names are excluded.
+pub fn detect_unknown(env: &dyn EnvSource) -> Vec<UnknownVar> {
+    let known: Vec<&'static str> = known_env_names().collect();
     let mut names: Vec<String> = env
         .names()
         .into_iter()
         .filter(|n| n.starts_with("TAIN_") && !known.contains(&n.as_str()))
+        .filter(|n| !is_injected_link_name(n))
         .collect();
     names.sort();
     names
         .into_iter()
         .map(|name| {
+            let suffix_len = name.len() - "TAIN_".len();
+            let max = (suffix_len / 3).clamp(1, MAX_SUGGESTION_DISTANCE);
             let suggestion = known
                 .iter()
                 .map(|k| (edit_distance(&name, k), *k))
                 .min()
-                .filter(|(d, _)| *d <= MAX_SUGGESTION_DISTANCE)
+                .filter(|(d, _)| *d <= max)
                 .map(|(_, k)| k);
             UnknownVar { name, suggestion }
         })
         .collect()
+}
+
+/// The first known variable that is set but not valid UTF-8. Such a value
+/// would otherwise read as unset and silently fall back to a default.
+pub fn non_unicode_var(env: &dyn EnvSource) -> Option<EnvError> {
+    known_env_names()
+        .find(|name| env.is_non_unicode(name))
+        .map(|var| EnvError::Invalid {
+            var,
+            msg: "is not valid UTF-8".into(),
+        })
 }
 
 /// Levenshtein distance over chars.
@@ -867,6 +906,82 @@ mod tests {
         );
         assert!(found[0].message().contains("did you mean `TAIN_LOG_LEVEL`"));
         assert!(!found[2].message().contains("did you mean"));
+    }
+
+    #[test]
+    fn short_unknown_names_get_a_suggestion_only_one_edit_away() {
+        let e = env(&[("TAIN_PATX", "1"), ("TAIN_PXRX", "1")]);
+        let pairs: Vec<(String, Option<&str>)> = detect_unknown(&e)
+            .into_iter()
+            .map(|u| (u.name, u.suggestion))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("TAIN_PATX".to_owned(), Some("TAIN_PATH")),
+                ("TAIN_PXRX".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_link_names_are_not_reported() {
+        let e = env(&[
+            ("TAIN_SERVICE_HOST", "10.0.0.1"),
+            ("TAIN_SERVICE_PORT", "80"),
+            ("TAIN_PORT", "tcp://10.0.0.1:80"),
+            ("TAIN_PORT_80_TCP_ADDR", "10.0.0.1"),
+            ("TAIN_NAME", "/web/tain"),
+            ("TAIN_ENV_FOO", "bar"),
+        ]);
+        assert_eq!(detect_unknown(&e), vec![]);
+    }
+
+    /// Records every key looked up; answers only the single-mirror basics.
+    #[derive(Default)]
+    struct RecordingEnv(std::cell::RefCell<Vec<String>>);
+
+    impl EnvSource for RecordingEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.borrow_mut().push(key.to_owned());
+            match key {
+                "TAIN_URL" => Some("http://example.com/debian".to_owned()),
+                "TAIN_DISTS" => Some("bookworm|main|amd64".to_owned()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn every_variable_read_is_a_known_name() {
+        let e = RecordingEnv::default();
+        GlobalOverrides::from_env(&e).unwrap();
+        try_single_source(&e).unwrap().unwrap();
+        let known: Vec<&str> = known_env_names().collect();
+        let read = e.0.borrow();
+        assert!(read.len() > 10, "{read:?}");
+        for key in read.iter().filter(|k| k.starts_with("TAIN_")) {
+            assert!(known.contains(&key.as_str()), "{key} is read but not known");
+        }
+    }
+
+    struct NonUnicodeEnv(&'static str);
+
+    impl EnvSource for NonUnicodeEnv {
+        fn get(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn is_non_unicode(&self, key: &str) -> bool {
+            key == self.0
+        }
+    }
+
+    #[test]
+    fn non_unicode_known_variable_is_an_error() {
+        let err = non_unicode_var(&NonUnicodeEnv("TAIN_CONFIG")).unwrap();
+        assert!(err.to_string().contains("TAIN_CONFIG"), "{err}");
+        assert!(non_unicode_var(&NonUnicodeEnv("OTHER")).is_none());
     }
 
     #[test]

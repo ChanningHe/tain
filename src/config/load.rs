@@ -60,6 +60,9 @@ pub fn load(opts: LoadOptions<'_>) -> Result<(Config, LoadMode), LoadError> {
     for u in env::detect_unknown(opts.env) {
         tracing::warn!("{}", u.message());
     }
+    if let Some(err) = env::non_unicode_var(opts.env) {
+        return Err(err.into());
+    }
 
     // An explicit path that is missing is an I/O error, never a silent fallthrough.
     let explicit_path = opts.cli_config.map(Path::to_path_buf).or_else(|| {
