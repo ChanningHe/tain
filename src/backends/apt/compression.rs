@@ -6,8 +6,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
-use bzip2::bufread::BzDecoder;
-use flate2::bufread::GzDecoder;
+use bzip2::bufread::MultiBzDecoder;
+use flate2::bufread::MultiGzDecoder;
 use xz2::bufread::XzDecoder;
 
 use super::index_selector::Compression;
@@ -30,10 +30,15 @@ pub fn open_decompressed(path: &Path) -> io::Result<Box<dyn BufRead>> {
 pub fn open_with(path: &Path, compression: Compression) -> io::Result<Box<dyn BufRead>> {
     let file = File::open(path).map_err(|e| annotate(e, path))?;
     let reader = BufReader::with_capacity(64 * 1024, file);
+    // Every concatenated stream / member is decoded (Ubuntu ships two-stream
+    // Packages.xz). apt stops after the first xz or bzip2 stream and reads
+    // all gzip members, so the entries parsed here are a superset of what
+    // clients see: the pool closure can only grow. Trailing bytes that are
+    // not a valid stream fail the index, where apt would ignore them.
     Ok(match compression {
-        Compression::Xz => Box::new(BufReader::new(XzDecoder::new(reader))),
-        Compression::Gz => Box::new(BufReader::new(GzDecoder::new(reader))),
-        Compression::Bz2 => Box::new(BufReader::new(BzDecoder::new(reader))),
+        Compression::Xz => Box::new(BufReader::new(XzDecoder::new_multi_decoder(reader))),
+        Compression::Gz => Box::new(BufReader::new(MultiGzDecoder::new(reader))),
+        Compression::Bz2 => Box::new(BufReader::new(MultiBzDecoder::new(reader))),
         Compression::None => Box::new(reader),
     })
 }
@@ -152,6 +157,41 @@ mod tests {
         enc.finish().unwrap();
         let out = read_to_vec(&p).unwrap();
         assert_eq!(out, b"BZ body");
+    }
+
+    #[test]
+    fn concatenated_streams_are_read_to_the_end() {
+        // Ubuntu ships Packages.xz with a trailing empty stream; a later
+        // stream or member must neither fail nor be dropped.
+        fn xz(b: &[u8]) -> Vec<u8> {
+            let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        }
+        fn gz(b: &[u8]) -> Vec<u8> {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        }
+        fn bz2(b: &[u8]) -> Vec<u8> {
+            let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        }
+        type Encode = fn(&[u8]) -> Vec<u8>;
+        let cases: [(&str, Encode); 3] = [
+            ("Packages.xz", xz),
+            ("Packages.gz", gz),
+            ("Packages.bz2", bz2),
+        ];
+        for (name, enc) in cases {
+            for tail in [&b""[..], &b"second\n"[..]] {
+                let p = tmp(name);
+                std::fs::write(&p, [enc(b"first\n"), enc(tail)].concat()).unwrap();
+                let out = read_to_vec(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(out, [&b"first\n"[..], tail].concat(), "{name}");
+            }
+        }
     }
 
     #[test]
