@@ -43,6 +43,16 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+# Only root and the tain user/group are mapped in; ReadWritePaths must be
+# writable by tain (owner or group), not by some other account.
+PrivateUsers=yes
+DevicePolicy=closed
 # DNS and HTTP(S) only.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Mirror files must be world-readable for the web server.

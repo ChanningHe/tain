@@ -34,6 +34,16 @@ ProtectClock=yes
 ProtectHostname=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+# Only root and the tain user/group are mapped in; ReadWritePaths must be
+# writable by tain (owner or group), not by some other account.
+PrivateUsers=yes
+DevicePolicy=closed
 # DNS and HTTP(S) only.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Mirror files must be world-readable for the web server.
@@ -48,5 +58,5 @@ Nice=10
 MemoryMax=4G
 
 # Exit codes: 0 ok, 1 partial, 2 config error, 3 lock held, 4 fatal I/O.
-# 1 and 3 are usually retryable; 2 and 4 need operator attention.
-SuccessExitStatus=0
+# 1 and 3 are usually retryable; 2 and 4 need operator attention. Every
+# non-zero exit marks the run failed (SuccessExitStatus= left at default).

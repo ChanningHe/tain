@@ -59,6 +59,11 @@ rather than editing the shipped files, which an upgrade replaces:
   `--metrics-file` writes outside the mirror (e.g. a node_exporter textfile
   directory), so that directory needs its own `ReadWritePaths=` line.
 - `MemoryMax=4G` caps memory use.
+- `PrivateUsers=yes` maps only root and the `tain` user and group into the
+  service. The mirror directory must be writable by `tain` as owner or
+  group; files owned by other accounts show up as `nobody`. On hosts with
+  user namespaces disabled the units fail with `status=217/USER`; set
+  `PrivateUsers=no` in a drop-in there.
 - `TimeoutStartSec=1d` (oneshot units) stops a hung sync so the next timer
   run can start. A sync killed this way is safe: the published tree is
   untouched and the next run resumes, keeping pool files already
@@ -80,9 +85,11 @@ rather than editing the shipped files, which an upgrade replaces:
 
 The units also run with no capabilities, `NoNewPrivileges=`,
 `ProtectSystem=strict`, `ProtectHome=`, `PrivateTmp=`, `PrivateDevices=`,
-`MemoryDenyWriteExecute=` and the other `Protect*`/`Restrict*` settings
-listed in the files, `UMask=0022` (the web server must read the mirror),
-and idle I/O priority with `Nice=10`.
+`MemoryDenyWriteExecute=`, a `SystemCallFilter=` allow list
+(`@system-service` minus `@privileged` and `@resources`; blocked calls fail
+with `EPERM`), `ProtectProc=invisible`/`ProcSubset=pid` and the other
+`Protect*`/`Restrict*` settings listed in the files, `UMask=0022` (the web
+server must read the mirror), and idle I/O priority with `Nice=10`.
 
 A package upgrade restarts a running `tain-daemon.service`. On stop the
 daemon lets an in-flight sync finish for up to `TimeoutStopSec=5min`, then
