@@ -11,5 +11,6 @@ pub mod mirrors_list;
 pub mod model;
 pub mod schedule;
 pub mod toml;
+mod toml_quote;
 
 pub use model::*;

@@ -1,5 +1,6 @@
 //! Human-readable `check` output: every setting as resolved (defaults and env
 //! overrides applied), laid out like the TOML input for easy comparison.
+//! Settings without a default appear as `# key = (unset)` comments.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -7,7 +8,11 @@ use std::time::Duration;
 use crate::config::model::{
     AptOptions, BackendOptions, Config, GcConfig, I18nSelection, MirrorConfig, VerifyConfig,
 };
+use crate::config::toml_quote::{toml_string, toml_string_list};
 use crate::observe::LogFormat;
+
+/// The filter logging starts with when `log_level` is unset.
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Format the resolved `Config`; always ends with a single newline.
 #[must_use]
@@ -27,51 +32,47 @@ pub fn format_config(cfg: &Config) -> String {
 fn write_global(out: &mut String, cfg: &Config) {
     let g = &cfg.global;
     writeln!(out, "[global]").unwrap();
-    writeln!(out, "target = {}", quote(&g.target.to_string_lossy())).unwrap();
+    writeln!(out, "target = {}", toml_string(&g.target.to_string_lossy())).unwrap();
     writeln!(out, "parallel = {}", g.parallel).unwrap();
     writeln!(out, "host_connections = {}", g.host_connections).unwrap();
     writeln!(out, "segments_per_file = {}", g.segments_per_file).unwrap();
     writeln!(
         out,
         "segment_min_size = {}",
-        quote(&format_bytes(g.segment_min_size))
+        toml_string(&format_bytes(g.segment_min_size))
     )
     .unwrap();
     writeln!(
         out,
         "connect_timeout = {}",
-        quote(&format_duration(g.timeout.connect))
+        toml_string(&format_duration(g.timeout.connect))
     )
     .unwrap();
     writeln!(
         out,
         "idle_timeout = {}",
-        quote(&format_duration(g.timeout.read_idle))
+        toml_string(&format_duration(g.timeout.read_idle))
     )
     .unwrap();
-    if let Some(ip) = g.bind_address {
-        writeln!(out, "bind_address = {}", quote(&ip.to_string())).unwrap();
-    }
-    writeln!(out, "user_agent = {}", quote(&g.user_agent)).unwrap();
+    let bind_address = g.bind_address.map(|ip| ip.to_string());
+    write_optional(out, "bind_address", bind_address.as_deref());
+    writeln!(out, "user_agent = {}", toml_string(&g.user_agent)).unwrap();
     writeln!(
         out,
         "log_format = {}",
-        quote(match g.log.format {
+        toml_string(match g.log.format {
             LogFormat::Text => "text",
             LogFormat::Json => "json",
         })
     )
     .unwrap();
-    if let Some(lvl) = &g.log.level {
-        writeln!(out, "log_level = {}", quote(lvl)).unwrap();
-    }
-    if let Some(s) = &g.schedule {
-        writeln!(out, "schedule = {}", quote(s)).unwrap();
-    }
+    let log_level = g.log.level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL);
+    writeln!(out, "log_level = {}", toml_string(log_level)).unwrap();
+    write_optional(out, "schedule", g.schedule.as_deref());
     writeln!(
         out,
         "lock_timeout = {}",
-        quote(&format_duration(g.lock_timeout))
+        toml_string(&format_duration(g.lock_timeout))
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -82,10 +83,10 @@ fn write_global(out: &mut String, cfg: &Config) {
 
 fn write_mirror(out: &mut String, m: &MirrorConfig) {
     writeln!(out, "[[mirror]]").unwrap();
-    writeln!(out, "name = {}", quote(&m.name)).unwrap();
-    writeln!(out, "backend = {}", quote(m.backend.name())).unwrap();
-    writeln!(out, "url = {}", quote(m.url.as_str())).unwrap();
-    writeln!(out, "path = {}", quote(&m.path.to_string_lossy())).unwrap();
+    writeln!(out, "name = {}", toml_string(&m.name)).unwrap();
+    writeln!(out, "backend = {}", toml_string(m.backend.name())).unwrap();
+    writeln!(out, "url = {}", toml_string(m.url.as_str())).unwrap();
+    writeln!(out, "path = {}", toml_string(&m.path.to_string_lossy())).unwrap();
     writeln!(out, "force_http1 = {}", m.force_http1).unwrap();
     match &m.backend_options {
         BackendOptions::Apt(a) => write_apt(out, a),
@@ -97,9 +98,14 @@ fn write_mirror(out: &mut String, m: &MirrorConfig) {
 }
 
 fn write_apt(out: &mut String, a: &AptOptions) {
-    writeln!(out, "suites = {}", string_list(&a.suites)).unwrap();
-    writeln!(out, "components = {}", string_list(&a.components)).unwrap();
-    writeln!(out, "architectures = {}", string_list(&a.architectures)).unwrap();
+    writeln!(out, "suites = {}", toml_string_list(&a.suites)).unwrap();
+    writeln!(out, "components = {}", toml_string_list(&a.components)).unwrap();
+    writeln!(
+        out,
+        "architectures = {}",
+        toml_string_list(&a.architectures)
+    )
+    .unwrap();
     writeln!(out, "create_suite_symlinks = {}", a.create_suite_symlinks).unwrap();
     writeln!(out).unwrap();
     writeln!(out, "[mirror.indexes]").unwrap();
@@ -110,7 +116,7 @@ fn write_apt(out: &mut String, a: &AptOptions) {
         match &a.indexes.i18n {
             I18nSelection::All => "true".to_owned(),
             I18nSelection::None => "false".to_owned(),
-            I18nSelection::Only(v) => string_list(v),
+            I18nSelection::Only(v) => toml_string_list(v),
         }
     )
     .unwrap();
@@ -122,10 +128,9 @@ fn write_apt(out: &mut String, a: &AptOptions) {
 
 fn write_verify(out: &mut String, v: &VerifyConfig) {
     writeln!(out, "[mirror.verify]").unwrap();
-    writeln!(out, "pgp = {}", quote(v.pgp.as_str())).unwrap();
-    if let Some(kr) = &v.keyring {
-        writeln!(out, "keyring = {}", quote(&kr.to_string_lossy())).unwrap();
-    }
+    writeln!(out, "pgp = {}", toml_string(v.pgp.as_str())).unwrap();
+    let keyring = v.keyring.as_ref().map(|kr| kr.to_string_lossy());
+    write_optional(out, "keyring", keyring.as_deref());
     writeln!(out, "allow_weak_hash = {}", v.allow_weak_hash).unwrap();
 }
 
@@ -135,7 +140,7 @@ fn write_gc(out: &mut String, g: &GcConfig) {
     writeln!(
         out,
         "grace_period = {}",
-        quote(&format_duration(g.grace_period))
+        toml_string(&format_duration(g.grace_period))
     )
     .unwrap();
     writeln!(out, "max_delete_ratio = {}", g.max_delete_ratio.as_f64()).unwrap();
@@ -176,32 +181,13 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
+/// `key = "value"`, or `# key = (unset)` for a setting without a default.
+fn write_optional(out: &mut String, key: &str, value: Option<&str>) {
+    match value {
+        Some(v) => writeln!(out, "{key} = {}", toml_string(v)),
+        None => writeln!(out, "# {key} = (unset)"),
     }
-    out.push('"');
-    out
-}
-
-fn string_list(v: &[String]) -> String {
-    let mut out = String::from("[");
-    for (i, s) in v.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&quote(s));
-    }
-    out.push(']');
-    out
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -276,6 +262,35 @@ keyring = "/etc/keys.gpg"
         let reparsed = toml_source::parse(&out)
             .unwrap_or_else(|e| panic!("check output rejected as input: {e}\n---\n{out}"));
         assert_eq!(format_config(&reparsed), out);
+    }
+
+    #[test]
+    fn control_characters_are_escaped_as_valid_toml() {
+        let text = r#"
+[[mirror]]
+name = "d"
+url = "http://x"
+suites = ["bookworm"]
+architectures = ["amd64"]
+"#;
+        let mut cfg = toml_source::parse(text).unwrap();
+        cfg.global.user_agent = "a\u{1}b\u{7f}\u{1b}[31m".into();
+        cfg.mirrors[0].verify.keyring = Some("/etc/key\u{7}ring.gpg".into());
+        let out = format_config(&cfg);
+        assert!(
+            out.contains(r#"user_agent = "a\u0001b\u007F\u001B[31m""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"keyring = "/etc/key\u0007ring.gpg""#),
+            "{out}"
+        );
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out}");
+        let table: ::toml::Table = ::toml::from_str(&out).unwrap();
+        assert_eq!(
+            table["global"]["user_agent"].as_str(),
+            Some(&*cfg.global.user_agent)
+        );
     }
 
     #[test]
