@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::core::types::{Digest, DigestAlgo, DigestError, DigestSet, DuplicateDigest};
+use crate::observe::untrusted::quote_untrusted;
 
 /// One `<hex> <size> <path>` fact, folded across algorithm blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,13 +63,13 @@ impl ReleaseChecksums {
         path: &str,
     ) -> Result<(), ChecksumError> {
         let bytes = decode_hex(hex).ok_or_else(|| ChecksumError::BadHex {
-            path: path.to_owned(),
+            path: quote_untrusted(path),
             algo,
-            hex: hex.to_owned(),
+            hex: quote_untrusted(hex),
         })?;
         let digest = Digest::new(algo, bytes).map_err(|e| match e {
             DigestError::LengthMismatch { expected, got, .. } => ChecksumError::HexLengthMismatch {
-                path: path.to_owned(),
+                path: quote_untrusted(path),
                 algo,
                 expected,
                 got,
@@ -79,7 +80,7 @@ impl ReleaseChecksums {
             let entry = &mut self.entries[idx];
             if entry.size != size {
                 return Err(ChecksumError::SizeConflict {
-                    path: path.to_owned(),
+                    path: quote_untrusted(path),
                     previous: entry.size,
                     current: size,
                 });
@@ -88,7 +89,7 @@ impl ReleaseChecksums {
                 .digests
                 .push(digest)
                 .map_err(|dup| ChecksumError::ConflictingDigest {
-                    path: path.to_owned(),
+                    path: quote_untrusted(path),
                     algo: dup.algo,
                     existing: dup.existing,
                     incoming: dup.incoming,
@@ -98,7 +99,7 @@ impl ReleaseChecksums {
             digests
                 .push(digest)
                 .map_err(|dup| ChecksumError::ConflictingDigest {
-                    path: path.to_owned(),
+                    path: quote_untrusted(path),
                     algo: dup.algo,
                     existing: dup.existing,
                     incoming: dup.incoming,
@@ -162,28 +163,29 @@ pub struct WeakHashReport {
     pub policy_dropped: bool,
 }
 
+/// Upstream text in fields is pre-rendered by [`quote_untrusted`].
 #[derive(Debug, thiserror::Error)]
 pub enum ChecksumError {
-    #[error("hex digest for {path:?} ({algo:?}) is not valid: {hex:?}")]
+    #[error("hex digest for {path} ({algo:?}) is not valid: {hex}")]
     BadHex {
         path: String,
         algo: DigestAlgo,
         hex: String,
     },
-    #[error("hex digest for {path:?} ({algo:?}) length mismatch: expected {expected}, got {got}")]
+    #[error("hex digest for {path} ({algo:?}) length mismatch: expected {expected}, got {got}")]
     HexLengthMismatch {
         path: String,
         algo: DigestAlgo,
         expected: usize,
         got: usize,
     },
-    #[error("checksum size mismatch for {path:?}: was {previous}, now {current}")]
+    #[error("checksum size mismatch for {path}: was {previous}, now {current}")]
     SizeConflict {
         path: String,
         previous: u64,
         current: u64,
     },
-    #[error("conflicting {algo:?} digest for {path:?}: existing {existing} vs incoming {incoming}")]
+    #[error("conflicting {algo:?} digest for {path}: existing {existing} vs incoming {incoming}")]
     ConflictingDigest {
         path: String,
         algo: DigestAlgo,
@@ -196,7 +198,7 @@ impl From<DuplicateDigest> for ChecksumError {
     /// For a bare `DigestSet::push` with no path in scope.
     fn from(dup: DuplicateDigest) -> Self {
         Self::ConflictingDigest {
-            path: String::new(),
+            path: quote_untrusted(""),
             algo: dup.algo,
             existing: dup.existing,
             incoming: dup.incoming,
@@ -234,6 +236,26 @@ mod tests {
 
     fn h(n: usize) -> String {
         "0".repeat(n)
+    }
+
+    #[test]
+    fn error_messages_are_bounded() {
+        let mut c = ReleaseChecksums::default();
+        let hex = format!("\x1b{}", "z".repeat(4 * 1024 * 1024));
+        let msg = c
+            .upsert(DigestAlgo::Sha256, &hex, 1, "main/Packages")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.len() < 1024, "{} bytes", msg.len());
+        assert!(!msg.contains('\x1b'), "{msg}");
+
+        let path = "p".repeat(4 * 1024 * 1024);
+        c.upsert(DigestAlgo::Sha256, &h(64), 1, &path).unwrap();
+        let msg = c
+            .upsert(DigestAlgo::Sha512, &h(128), 2, &path)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.len() < 1024, "{} bytes", msg.len());
     }
 
     #[test]
@@ -292,7 +314,7 @@ mod tests {
                 existing,
                 incoming,
             } => {
-                assert_eq!(path, "main/binary-amd64/Packages");
+                assert_eq!(path, "\"main/binary-amd64/Packages\"");
                 assert_eq!(algo, DigestAlgo::Sha256);
                 assert_eq!(existing, h(64));
                 assert_eq!(incoming, "f".repeat(64));

@@ -5,6 +5,7 @@
 
 use crate::backends::apt::layout::{LayoutError, SuiteLayout};
 use crate::core::types::{Digest, DigestAlgo, DigestSet, FileSpec, Layer, PathError};
+use crate::observe::untrusted::{clip_untrusted, quote_untrusted};
 
 /// Parse a SHA256SUMS body into one `FileSpec` per listed file.
 ///
@@ -58,7 +59,7 @@ pub fn parse_installer_sums(
         if hex_clean.len() != 64 || !hex_clean.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(InstallerSumsError::MalformedLine {
                 line: line_no,
-                reason: format!("expected 64 hex chars, got {hex_clean:?}"),
+                reason: format!("expected 64 hex chars, got {}", quote_untrusted(hex_clean)),
             });
         }
         let bytes = decode_hex(hex_clean).ok_or_else(|| InstallerSumsError::MalformedLine {
@@ -87,15 +88,15 @@ pub fn parse_installer_sums(
                 .suite_rel(&suite_rel_str)
                 .map_err(|e| InstallerSumsError::UnsafePath {
                     line: line_no,
-                    path: path_field.to_owned(),
-                    reason: e.to_string(),
+                    path: quote_untrusted(path_field),
+                    reason: clip_untrusted(&e.to_string()),
                 })?;
         let url = layout
             .suite_url(&suite_rel_str)
             .map_err(|e| InstallerSumsError::UrlBuild {
                 line: line_no,
-                path: path_field.to_owned(),
-                reason: e.to_string(),
+                path: quote_untrusted(path_field),
+                reason: clip_untrusted(&e.to_string()),
             })?;
 
         out.push(FileSpec {
@@ -136,17 +137,19 @@ fn ascii_hex_value(b: u8) -> Option<u8> {
     }
 }
 
+/// Upstream text in fields is pre-rendered by [`quote_untrusted`] or
+/// [`clip_untrusted`].
 #[derive(Debug, thiserror::Error)]
 pub enum InstallerSumsError {
     #[error("SHA256SUMS line {line}: {reason}")]
     MalformedLine { line: u32, reason: String },
-    #[error("SHA256SUMS line {line}: refusing unsafe path {path:?}: {reason}")]
+    #[error("SHA256SUMS line {line}: refusing unsafe path {path}: {reason}")]
     UnsafePath {
         line: u32,
         path: String,
         reason: String,
     },
-    #[error("SHA256SUMS line {line}: failed to build URL for {path:?}: {reason}")]
+    #[error("SHA256SUMS line {line}: failed to build URL for {path}: {reason}")]
     UrlBuild {
         line: u32,
         path: String,
@@ -172,6 +175,24 @@ mod tests {
     }
 
     const H: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+    #[test]
+    fn error_messages_are_bounded() {
+        let base = layout();
+        let l = sl(&base, "bookworm");
+        let huge = "z".repeat(4 * 1024 * 1024);
+        for body in [
+            format!("\x1b{huge}  ./netboot/mini.iso\n"),
+            format!("{H}  ./{huge}/../mini.iso\n"),
+            format!("{H}  ./{huge}\n"),
+        ] {
+            let msg = parse_installer_sums(&body, "main/installer-amd64/1/images", &l)
+                .unwrap_err()
+                .to_string();
+            assert!(msg.len() < 2048, "{} bytes", msg.len());
+            assert!(!msg.contains('\x1b'));
+        }
+    }
 
     #[test]
     fn parses_canonical_gnu_sha256sum_lines() {

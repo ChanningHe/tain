@@ -113,3 +113,76 @@ async fn oversized_release_date_is_truncated_in_logs() {
         stderr.len()
     );
 }
+
+fn assert_bounded_failure(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the hostile suite must fail the sync"
+    );
+    assert!(
+        stderr.lines().all(|l| l.len() <= MAX_LOG_LINE),
+        "overlong log line ({} bytes of stderr): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(4096)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_release_checksum_line_is_bounded_in_logs() {
+    // Arrange: a 4 MiB non-hex digest in the SHA256 block.
+    let serve = TempDir::new("untrusted-hex-serve");
+    let target = TempDir::new("untrusted-hex-target");
+    SyntheticRepo::new(serve.path().to_path_buf(), "bookworm")
+        .add_package("hello", b"hello deb".to_vec())
+        .write();
+    let bad = format!("SHA256:\n {} 1 main/extra\n", "z".repeat(4 * 1024 * 1024));
+    for name in ["Release", "InRelease"] {
+        let path = serve.path().join("dists/bookworm").join(name);
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, body.replacen("SHA256:\n", &bad, 1)).unwrap();
+    }
+
+    // Act
+    let out = sync_once(serve.path(), target.path()).await;
+
+    // Assert
+    assert_bounded_failure(&out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_pool_filename_is_bounded_in_logs() {
+    // Arrange: Packages names a 4 MiB pool path; Release vouches for it.
+    let serve = TempDir::new("untrusted-filename-serve");
+    let target = TempDir::new("untrusted-filename-target");
+    let dists = serve.path().join("dists/bookworm");
+    std::fs::create_dir_all(dists.join("main/binary-amd64")).unwrap();
+    let packages = format!(
+        "Package: evil\nFilename: pool/{}.deb\nSize: 1\nSHA256: {}\n",
+        "a".repeat(4 * 1024 * 1024),
+        "0".repeat(64)
+    );
+    std::fs::write(dists.join("main/binary-amd64/Packages"), &packages).unwrap();
+    let release = format!(
+        "Suite: bookworm\nCodename: bookworm\nArchitectures: amd64\nComponents: main\n\
+         {REAL_DATE_LINE}SHA256:\n {} {} main/binary-amd64/Packages\n",
+        sha256_hex(packages.as_bytes()),
+        packages.len()
+    );
+    std::fs::write(dists.join("Release"), &release).unwrap();
+    std::fs::write(dists.join("InRelease"), &release).unwrap();
+
+    // Act
+    let out = sync_once(serve.path(), target.path()).await;
+
+    // Assert
+    assert_bounded_failure(&out);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

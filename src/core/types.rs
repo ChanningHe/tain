@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use url::Url;
 
+use crate::observe::untrusted::quote_untrusted;
+
 /// Publish layer. Layers publish in order so every index a client can read
 /// references only files already in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,43 +34,62 @@ pub struct RelPath(String);
 /// `.prev.tain~` publish swaps); core must keep its sidecar names ending in it.
 const SIDECAR_SUFFIX: char = '~';
 
+/// Longest accepted path (Linux `PATH_MAX`).
+pub const MAX_REL_PATH_BYTES: usize = 4096;
+/// Longest accepted path segment (Linux `NAME_MAX`).
+pub const MAX_SEGMENT_BYTES: usize = 255;
+
 impl RelPath {
     /// # Errors
     ///
-    /// `PathError` if empty, absolute, or containing NUL, control characters,
-    /// backslash, `.`/`..` components, or empty segments; or if it names the
-    /// private `.tain/` tree or a `~`-suffixed (sidecar) segment.
+    /// `PathError` if empty, longer than [`MAX_REL_PATH_BYTES`] or with a
+    /// segment longer than [`MAX_SEGMENT_BYTES`], absolute, or containing NUL,
+    /// control characters, backslash, `.`/`..` components, or empty segments;
+    /// or if it names the private `.tain/` tree or a `~`-suffixed (sidecar)
+    /// segment.
     pub fn new(s: impl Into<String>) -> Result<Self, PathError> {
         let s = s.into();
         if s.is_empty() {
             return Err(PathError::Empty);
         }
+        if s.len() > MAX_REL_PATH_BYTES {
+            return Err(PathError::TooLong {
+                path: quote_untrusted(&s),
+                len: s.len(),
+            });
+        }
+        if let Some(seg) = s.split('/').find(|seg| seg.len() > MAX_SEGMENT_BYTES) {
+            return Err(PathError::SegmentTooLong {
+                path: quote_untrusted(&s),
+                len: seg.len(),
+            });
+        }
         if s.starts_with('/') {
-            return Err(PathError::Absolute(s));
+            return Err(PathError::Absolute(quote_untrusted(&s)));
         }
         if s.contains('\0') {
-            return Err(PathError::Nul(s));
+            return Err(PathError::Nul(quote_untrusted(&s)));
         }
         if s.chars().any(char::is_control) {
-            return Err(PathError::Control(s));
+            return Err(PathError::Control(quote_untrusted(&s)));
         }
         if s.contains('\\') {
-            return Err(PathError::Backslash(s));
+            return Err(PathError::Backslash(quote_untrusted(&s)));
         }
         if s.split('/').next() == Some(crate::core::store::STATE_DIR)
             || s.split('/').any(|seg| seg.ends_with(SIDECAR_SUFFIX))
         {
-            return Err(PathError::Reserved(s));
+            return Err(PathError::Reserved(quote_untrusted(&s)));
         }
         if s.split('/').any(|seg| seg == "..") {
-            return Err(PathError::ParentTraversal(s));
+            return Err(PathError::ParentTraversal(quote_untrusted(&s)));
         }
         // `.` and empty segments would give one path several dedup keys.
         if s.split('/').any(|seg| seg == ".") {
-            return Err(PathError::CurrentDir(s));
+            return Err(PathError::CurrentDir(quote_untrusted(&s)));
         }
         if s.split('/').any(str::is_empty) {
-            return Err(PathError::EmptySegment(s));
+            return Err(PathError::EmptySegment(quote_untrusted(&s)));
         }
         Ok(Self(s))
     }
@@ -90,26 +111,31 @@ impl std::fmt::Display for RelPath {
     }
 }
 
-/// Paths are untrusted upstream text, so `{0:?}` escapes them for logs.
+/// Paths are untrusted upstream text, so the fields hold
+/// [`quote_untrusted`] renderings.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
     #[error("relative path is empty")]
     Empty,
-    #[error("relative path {0:?} starts with `/` (absolute)")]
+    #[error("relative path {path} is {len} bytes long (limit {MAX_REL_PATH_BYTES})")]
+    TooLong { path: String, len: usize },
+    #[error("relative path {path} has a {len}-byte segment (limit {MAX_SEGMENT_BYTES})")]
+    SegmentTooLong { path: String, len: usize },
+    #[error("relative path {0} starts with `/` (absolute)")]
     Absolute(String),
-    #[error("relative path {0:?} contains a `..` component")]
+    #[error("relative path {0} contains a `..` component")]
     ParentTraversal(String),
-    #[error("relative path {0:?} contains a `.` component")]
+    #[error("relative path {0} contains a `.` component")]
     CurrentDir(String),
-    #[error("relative path {0:?} contains an empty segment (`//` or trailing `/`)")]
+    #[error("relative path {0} contains an empty segment (`//` or trailing `/`)")]
     EmptySegment(String),
-    #[error("relative path {0:?} contains a NUL byte")]
+    #[error("relative path {0} contains a NUL byte")]
     Nul(String),
-    #[error("relative path {0:?} contains a control character")]
+    #[error("relative path {0} contains a control character")]
     Control(String),
-    #[error("relative path {0:?} contains a backslash")]
+    #[error("relative path {0} contains a backslash")]
     Backslash(String),
-    #[error("relative path {0:?} is reserved for tain (`.tain/` or a `~` sidecar name)")]
+    #[error("relative path {0} is reserved for tain (`.tain/` or a `~` sidecar name)")]
     Reserved(String),
 }
 
@@ -332,6 +358,41 @@ mod tests {
         );
         assert!(RelPath::new("dists/bookworm/InRelease").is_ok());
         assert!(RelPath::new("a").is_ok());
+    }
+
+    /// `segments` of `seg_len` bytes joined by `/`.
+    fn path_of(segments: usize, seg_len: usize) -> String {
+        vec!["a".repeat(seg_len); segments].join("/")
+    }
+
+    #[test]
+    fn relpath_accepts_paths_at_the_length_limits() {
+        assert!(RelPath::new("a".repeat(255)).is_ok());
+        let at_limit = format!("{}/{}/a", path_of(15, 255), "b".repeat(254));
+        assert_eq!(at_limit.len(), MAX_REL_PATH_BYTES);
+        assert!(RelPath::new(at_limit).is_ok());
+    }
+
+    #[test]
+    fn relpath_rejects_overlong_segment() {
+        let err = RelPath::new(format!("pool/{}.deb", "a".repeat(252))).unwrap_err();
+        assert!(matches!(err, PathError::SegmentTooLong { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn relpath_rejects_overlong_path() {
+        let err = RelPath::new(path_of(17, 255)).unwrap_err();
+        assert!(matches!(err, PathError::TooLong { .. }), "{err:?}");
+        let huge = format!("pool/{}", "a/".repeat(2 * 1024 * 1024));
+        let msg = RelPath::new(huge).unwrap_err().to_string();
+        assert!(msg.len() < 1024, "{} bytes", msg.len());
+    }
+
+    #[test]
+    fn relpath_error_messages_are_bounded() {
+        let msg = RelPath::new("\x01".repeat(4000)).unwrap_err().to_string();
+        assert!(msg.len() < 1024, "{} bytes", msg.len());
+        assert!(!msg.contains('\x01'));
     }
 
     #[test]
