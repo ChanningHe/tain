@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
+use super::lines::{dropped_parts, kept_components, skip_reason, skipped_entries};
 use super::mirror_paths::{self, canonical};
 use super::{DebEntry, DebKind, Entry};
-use crate::backends::apt::unsafe_suite_reason;
-use crate::config::env::derive_name_from_url;
-use crate::config::model::{
-    has_control_chars, has_query_or_fragment, is_apt_value, is_flat_suite, normalize_mirror_path,
-};
+use crate::backends::apt::nested_suite_pair;
+use crate::config::env::{derive_name_from_url, truncate_slug};
+use crate::config::model::{MAX_FILE_NAME_BYTES, normalize_mirror_path};
+use crate::config::toml_quote::{comment_safe, toml_string, toml_string_list};
 
 /// Default architecture for lines that declare none (also `[defaults]`).
 const DEFAULT_ARCH: &str = "amd64";
@@ -22,47 +22,8 @@ const DEFAULT_ARCH: &str = "amd64";
 /// Used when a URL slug is not a usable directory name.
 const FALLBACK_NAME: &str = "mirror";
 
-/// Why a line cannot be converted, or `None` if it can.
-#[must_use]
-pub fn skip_reason(d: &DebEntry) -> Option<&'static str> {
-    if is_flat_suite(&d.suite) {
-        Some("flat repositories are not supported yet")
-    } else if !matches!(d.url.scheme(), "http" | "https") {
-        Some("only http and https URLs are supported")
-    } else if d.components.is_empty() {
-        Some("a dists-style suite needs at least one component")
-    } else if std::iter::once(&d.suite)
-        .chain(&d.components)
-        .chain(d.arch_override.iter().flatten())
-        .any(|s| has_control_chars(s))
-    {
-        Some("a suite, component or architecture contains control characters")
-    } else if !is_apt_value(&d.suite, true)
-        || !d
-            .components
-            .iter()
-            .chain(d.arch_override.iter().flatten())
-            .all(|s| is_apt_value(s, false))
-    {
-        Some("a suite, component or architecture contains characters apt archives do not use")
-    } else if has_query_or_fragment(&d.url) {
-        Some("the URL has a query or fragment, which tain cannot request")
-    } else if unsafe_suite_reason(&d.url, &d.suite).is_some() {
-        Some("the suite does not stay inside the mirror")
-    } else {
-        None
-    }
-}
-
-/// Lines that `to_toml` emits only as comments, with the reason.
-pub fn skipped_entries(entries: &[Entry]) -> impl Iterator<Item = (&DebEntry, &'static str)> {
-    entries.iter().filter_map(|e| match e {
-        Entry::Deb(d) => skip_reason(d).map(|r| (d, r)),
-        Entry::MirrorPath { .. } => None,
-    })
-}
-
-/// One output `[[mirror]]`: every line for one URL + keyring.
+/// One output `[[mirror]]`: lines for one URL + keyring whose suites do
+/// not nest.
 #[derive(Debug)]
 struct Group {
     url: Url,
@@ -91,10 +52,21 @@ impl Group {
         }
     }
 
+    /// Whether `suite` can join: a mirror publishes each suite by replacing
+    /// its directory, so no suite may lie inside another.
+    fn takes_suite(&self, suite: &str) -> bool {
+        if self.suites.iter().any(|s| s == suite) {
+            return true;
+        }
+        let mut suites = self.suites.clone();
+        suites.push(suite.to_owned());
+        nested_suite_pair(&self.url, &suites).is_none()
+    }
+
     fn add(&mut self, d: &DebEntry) {
         self.first_line = self.first_line.min(d.line);
         push_unique(&mut self.suites, &d.suite);
-        for c in &d.components {
+        for c in kept_components(d) {
             push_unique(&mut self.components, c);
         }
         match (d.kind, &d.arch_override) {
@@ -126,20 +98,22 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
 
 /// Group lines by URL + keyring, unioning architectures: tain mirrors the
 /// suites × components × arches product, and two mirrors of one URL would
-/// only fight over the same tree. `deb-src` joins the binary group of its
-/// URL (same keyring preferred), whatever its options say.
+/// only fight over the same tree. A suite nested in another one of the
+/// group starts a separate mirror instead. `deb-src` joins a binary group
+/// of its URL (same keyring preferred), whatever its options say.
 fn group_lines(debs: &[&DebEntry]) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let binaries = debs.iter().filter(|d| d.kind == DebKind::Binary);
     let sources = debs.iter().filter(|d| d.kind == DebKind::Source);
     for d in binaries.chain(sources) {
         let url = canonical(&d.url);
+        let fits = |g: &Group| g.url == url && g.takes_suite(&d.suite);
         let exact = groups
             .iter()
-            .position(|g| g.url == url && g.keyring == d.keyring);
+            .position(|g| fits(g) && g.keyring == d.keyring);
         let idx = match d.kind {
             DebKind::Binary => exact,
-            DebKind::Source => exact.or_else(|| groups.iter().position(|g| g.url == url)),
+            DebKind::Source => exact.or_else(|| groups.iter().position(fits)),
         };
         let group = match idx {
             Some(i) => &mut groups[i],
@@ -169,11 +143,42 @@ fn group_names(groups: &[Group]) -> Vec<String> {
                 FALLBACK_NAME.to_owned()
             };
             let name = std::iter::once(base.clone())
-                .chain((2..).map(|n| format!("{base}-{n}")))
+                .chain((2..).map(|n| suffixed_name(&base, n)))
                 .find(|n| !used.contains(n))
                 .expect("unbounded candidates");
             used.insert(name.clone());
             name
+        })
+        .collect()
+}
+
+/// `base-n`, with `base` cut so the name still fits a directory entry.
+fn suffixed_name(base: &str, n: usize) -> String {
+    let suffix = format!("-{n}");
+    let head = truncate_slug(base, MAX_FILE_NAME_BYTES - suffix.len());
+    format!("{head}{suffix}")
+}
+
+/// Per group: a note when other groups mirror the same URL, since each of
+/// them downloads the whole pool again.
+fn shared_url_notes(groups: &[Group], names: &[String]) -> Vec<Option<String>> {
+    groups
+        .iter()
+        .map(|g| {
+            let sharing: Vec<String> = groups
+                .iter()
+                .zip(names)
+                .filter(|(other, _)| other.url == g.url)
+                .map(|(_, name)| format!("`{name}`"))
+                .collect();
+            (sharing.len() > 1).then(|| {
+                format!(
+                    "mirrors {} use the same URL, split because their signed-by keyrings \
+                     differ or one suite lies inside another, so each downloads its own copy \
+                     of the pool; one keyring file for all lines avoids a keyring split",
+                    sharing.join(", ")
+                )
+            })
         })
         .collect()
 }
@@ -191,19 +196,12 @@ pub fn to_toml(entries: &[Entry]) -> String {
     convert(entries).toml
 }
 
-/// Emit TOML: one `[[mirror]]` per URL + keyring (see `group_lines`), with
+/// Emit TOML: one `[[mirror]]` per group (see `group_lines`), with
 /// `mirror_path` applied only where it yields a valid, unshared directory.
 /// Anything not applied is both a TOML comment and a warning.
 #[must_use]
 pub fn convert(entries: &[Entry]) -> Conversion {
-    let debs: Vec<&DebEntry> = entries
-        .iter()
-        .filter_map(|e| match e {
-            // `write_skipped_block` keeps unsupported lines as comments.
-            Entry::Deb(d) if skip_reason(d).is_none() => Some(d),
-            _ => None,
-        })
-        .collect();
+    let debs = converted_lines(entries);
     let has_mirror_paths = entries
         .iter()
         .any(|e| matches!(e, Entry::MirrorPath { .. }));
@@ -212,17 +210,9 @@ pub fn convert(entries: &[Entry]) -> Conversion {
     let names = group_names(&groups);
     let urls: Vec<&Url> = groups.iter().map(|g| &g.url).collect();
     let paths = mirror_paths::resolve(entries, &urls, &names);
-
-    let mut warnings: Vec<String> = skipped_entries(entries)
-        .map(|(d, reason)| format!("line {} not converted: {reason}", d.line))
-        .collect();
-    warnings.extend(paths.unused.iter().cloned());
-    warnings.extend(
-        paths
-            .per_mirror
-            .iter()
-            .filter_map(|p| p.as_ref().and_then(|r| r.as_ref().err()).cloned()),
-    );
+    let notes = shared_url_notes(&groups, &names);
+    let dropped: Vec<String> = debs.iter().flat_map(|d| dropped_parts(d)).collect();
+    let warnings = collect_warnings(entries, &paths, &dropped, &notes);
 
     let any_no_arch = groups.iter().any(|g| g.architectures().is_none());
     let mut out = String::new();
@@ -244,19 +234,46 @@ pub fn convert(entries: &[Entry]) -> Conversion {
         out.push_str("architectures = [\"amd64\"]\n\n");
     }
 
-    for ((g, name), path) in groups.iter().zip(&names).zip(paths.per_mirror) {
-        write_mirror(&mut out, g, name, path);
+    for (((g, name), path), note) in groups.iter().zip(&names).zip(paths.per_mirror).zip(&notes) {
+        write_mirror(&mut out, g, name, path, note.as_deref());
     }
 
     write_skipped_block(&mut out, entries);
+    if !dropped.is_empty() {
+        writeln!(out, "# Partly converted:").unwrap();
+        for msg in &dropped {
+            writeln!(out, "# {msg}").unwrap();
+        }
+    }
     Conversion {
         toml: out,
         warnings,
     }
 }
 
-fn write_mirror(out: &mut String, g: &Group, name: &str, path: Option<Result<PathBuf, String>>) {
+/// `deb` lines that become (part of) a mirror; `write_skipped_block` keeps
+/// the others as comments.
+fn converted_lines(entries: &[Entry]) -> Vec<&DebEntry> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Deb(d) if skip_reason(d).is_none() => Some(&**d),
+            _ => None,
+        })
+        .collect()
+}
+
+fn write_mirror(
+    out: &mut String,
+    g: &Group,
+    name: &str,
+    path: Option<Result<PathBuf, String>>,
+    note: Option<&str>,
+) {
     writeln!(out, "[[mirror]]").unwrap();
+    if let Some(note) = note {
+        writeln!(out, "# {}", comment_safe(note)).unwrap();
+    }
     writeln!(out, "name = {}", toml_string(name)).unwrap();
     writeln!(out, "url = {}", toml_string(g.url.as_str())).unwrap();
     match path {
@@ -273,28 +290,46 @@ fn write_mirror(out: &mut String, g: &Group, name: &str, path: Option<Result<Pat
         writeln!(out, "[mirror.indexes]").unwrap();
         writeln!(out, "sources = true").unwrap();
     }
+    // `skip_reason` lets only a usable keyring through, and none without pgp.
     if let Some(kr) = &g.keyring {
-        let kr = kr.to_string_lossy();
-        if cfg!(feature = "pgp") {
-            writeln!(out, "[mirror.verify]").unwrap();
-            writeln!(out, "pgp = \"required\"").unwrap();
-            writeln!(out, "keyring = {}", toml_string(&kr)).unwrap();
-        } else {
-            writeln!(
-                out,
-                "# signed-by=`{}` not applied: this tain build has no OpenPGP support",
-                comment_safe(&kr)
-            )
-            .unwrap();
-        }
+        writeln!(out, "[mirror.verify]").unwrap();
+        writeln!(out, "pgp = \"required\"").unwrap();
+        writeln!(out, "keyring = {}", toml_string(&kr.to_string_lossy())).unwrap();
     }
     out.push('\n');
 }
 
+/// Every message the TOML carries as a comment, for stderr; a shared-URL
+/// note repeats in each affected mirror but is reported once.
+fn collect_warnings(
+    entries: &[Entry],
+    paths: &mirror_paths::Resolution,
+    dropped: &[String],
+    notes: &[Option<String>],
+) -> Vec<String> {
+    let skipped = skipped_entries(entries)
+        .map(|(d, reason)| format!("line {} not converted: {reason}", d.line));
+    let path_errors = paths
+        .per_mirror
+        .iter()
+        .filter_map(|p| p.as_ref().and_then(|r| r.as_ref().err()).cloned());
+    let mut out: Vec<String> = skipped
+        .chain(dropped.iter().cloned())
+        .chain(paths.unused.iter().cloned())
+        .chain(path_errors)
+        .collect();
+    for note in notes.iter().flatten() {
+        if !out.contains(note) {
+            out.push(note.clone());
+        }
+    }
+    out
+}
+
 fn write_skipped_block(out: &mut String, entries: &[Entry]) {
-    let mut by_reason: BTreeMap<&str, Vec<&DebEntry>> = BTreeMap::new();
+    let mut by_reason: BTreeMap<String, Vec<&DebEntry>> = BTreeMap::new();
     for (d, reason) in skipped_entries(entries) {
-        by_reason.entry(reason).or_default().push(d);
+        by_reason.entry(reason.into_owned()).or_default().push(d);
     }
     for (reason, lines) in by_reason {
         writeln!(out, "# Not converted: {reason}.").unwrap();
@@ -304,43 +339,13 @@ fn write_skipped_block(out: &mut String, entries: &[Entry]) {
     }
 }
 
-/// TOML comments may not contain control characters other than tab.
-fn comment_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() && c != '\t' { '?' } else { c })
-        .collect()
-}
-
-/// TOML basic string; every control character is escaped.
-fn toml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => write!(out, "\\u{:04X}", u32::from(c)).unwrap(),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn toml_string_list(v: &[String]) -> String {
-    let items: Vec<String> = v.iter().map(|s| toml_string(s)).collect();
-    format!("[{}]", items.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::parse;
     use super::*;
     use crate::config::Config;
     use crate::config::load::{LoadOptions, load};
-    use crate::config::model::{AptOptions, BackendOptions, MirrorConfig};
+    use crate::config::model::{AptOptions, BackendOptions, MirrorConfig, is_flat_suite};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -490,10 +495,10 @@ mod tests {
 
     #[cfg(not(feature = "pgp"))]
     #[test]
-    fn keyring_is_a_comment_without_pgp_feature() {
-        let (out, _) = import("deb [signed-by=/etc/keys.gpg] http://x bookworm main\n");
-        assert!(!out.contains("[mirror.verify]"), "{out}");
-        assert!(out.contains("no OpenPGP support"), "{out}");
+    fn signed_line_is_not_converted_without_pgp_feature() {
+        let (out, cfg) = import("deb [signed-by=/etc/keys.gpg] http://x bookworm main\n");
+        assert!(cfg.mirrors.is_empty(), "{out}");
+        assert!(out.contains("OpenPGP support"), "{out}");
     }
 
     #[test]
@@ -533,10 +538,10 @@ mod tests {
 
     #[test]
     fn mirror_path_shared_by_two_mirrors_is_applied_once() {
-        // Different keyrings keep two mirrors; the dir must not be reused.
+        // Nested suites keep two mirrors; the dir must not be reused.
         let text = "mirror_path http://x shared\n\
-                    deb [signed-by=/a.gpg] http://x bookworm main\n\
-                    deb [signed-by=/b.gpg] http://x bookworm main\n";
+                    deb http://x stable main\n\
+                    deb http://x stable/updates main\n";
         let (out, cfg) = import(text);
         assert_eq!(cfg.mirrors.len(), 2, "{out}");
         assert_eq!(cfg.mirrors[0].path, PathBuf::from("shared"));
@@ -734,5 +739,33 @@ mod tests {
                     deb http://x/\u{1}ctl bookworm main\u{7f}\n";
         let (out, cfg) = import(text);
         assert!(!cfg.mirrors.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn suffixed_name_fits_a_directory_entry() {
+        let long = "a".repeat(MAX_FILE_NAME_BYTES);
+        let suffixed = suffixed_name(&long, 12);
+        assert_eq!(suffixed.len(), MAX_FILE_NAME_BYTES);
+        assert!(suffixed.ends_with("a-12"), "{suffixed}");
+        assert_eq!(suffixed_name("short", 2), "short-2");
+        let dash_at_cut = format!("{}-{}", "a".repeat(252), "b".repeat(10));
+        assert_eq!(
+            suffixed_name(&dash_at_cut, 2),
+            format!("{}-2", "a".repeat(252))
+        );
+    }
+
+    #[test]
+    fn nested_suites_of_one_url_become_separate_mirrors() {
+        let text = "deb http://x/debian stable main\n\
+                    deb http://x/debian stable/updates main\n\
+                    deb http://x/debian testing main\n\
+                    deb-src http://x/debian stable/updates main\n";
+        let (out, cfg) = import(text);
+        assert_eq!(cfg.mirrors.len(), 2, "{out}");
+        assert_eq!(apt(&cfg.mirrors[0]).suites, vec!["stable", "testing"]);
+        assert_eq!(apt(&cfg.mirrors[1]).suites, vec!["stable/updates"]);
+        assert!(apt(&cfg.mirrors[1]).indexes.sources, "{out}");
+        assert_ne!(cfg.mirrors[0].path, cfg.mirrors[1].path);
     }
 }

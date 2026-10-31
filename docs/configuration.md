@@ -2,8 +2,9 @@
 
 This page documents every configuration key that `tain` 0.1.1 understands.
 Run `tain check` at any time to see the fully resolved configuration (all
-defaults filled in, all environment overrides applied). It makes no
-network requests and writes nothing.
+defaults filled in, all environment overrides applied; a setting without
+a default shows as a `# key = (unset)` comment). It makes no network
+requests and writes nothing.
 
 - [Configuration sources](#configuration-sources)
 - [Value formats](#value-formats)
@@ -559,21 +560,54 @@ The converter reads an apt-mirror `mirror.list` (`-` reads from
 stdin) and prints TOML on stdout. It understands:
 
 - `deb`, `deb-src` and `deb-<arch>` lines (`deb-amd64 URL SUITE COMP...`);
-- an options bracket `[arch=amd64,arm64 signed-by=/path/key.gpg]`;
+- an options bracket right after the directive, such as
+  `[arch=amd64,arm64 signed-by=/path/key.gpg]` (see below);
 - `mirror_path <url-prefix> <dir>`, which becomes the mirror's `path`;
-- `#` comments and blank lines.
+- `#` comments (at line start or after whitespace) and blank lines.
 
-Other directives, such as apt-mirror's `set` and `clean` lines, are
-rejected with a line number; delete them first. Lines for the same URL
-(a trailing `/` does not count) and keyring merge into one `[[mirror]]` with the union of their suites,
+As in apt, only ASCII whitespace (space, tab, CR, LF, vertical tab, form
+feed) separates fields; any other Unicode space is part of a field. A `[`
+elsewhere on the line, as in an IPv6 URL `http://[2001:db8::1]/debian`,
+is part of its field. Quoted fields and `%XX` escapes are not decoded.
+Other directives, such as apt-mirror's `set` and `clean` lines, and an
+options entry that is not `key=value` with both parts set, are rejected
+with a line number; delete or fix them first.
+
+Options are handled as follows:
+
+- `arch=` sets the architectures; `arch+=` / `arch-=` edit the list from
+  `arch=` or a `deb-<arch>` directive. With neither, they would edit
+  apt's configured architectures, which the importer cannot see, so the
+  line is not converted.
+- `signed-by=` becomes `verify.pgp = "required"` with that keyring when
+  it is one absolute path. Key fingerprints, several keyrings and
+  relative paths cannot become a keyring file, so the line is not
+  converted: a mirror of it would not check signatures. In a build
+  without OpenPGP support, no line with `signed-by=` is converted.
+- `lang`, `target` (also with `+=` / `-=`), `trusted`, `pdiffs`,
+  `by-hash`, `check-valid-until`, `valid-until-min`, `valid-until-max`,
+  `check-date`, `date-max-future`, `allow-insecure`, `allow-weak` and
+  `allow-downgrade-to-insecure` do not change what tain mirrors (indexes
+  are chosen in `[mirror.indexes]`, and tain verifies exactly what
+  `signed-by=` names); they are ignored with a warning.
+- `snapshot`, `inrelease-path` and any other key change what apt
+  fetches or are unknown, so the line is not converted.
+
+Lines for the same URL (a trailing `/` does not count) and `signed-by=`
+value merge into one `[[mirror]]` with the union of their suites,
 components and architectures (a line without an architecture contributes
-`amd64`). A `deb-src` line joins the mirror of its URL, whatever its
-options, and turns on `indexes.sources`. `signed-by=` becomes
-`verify.pgp = "required"` with that keyring. If a mirror ends up with no
-architecture, the output adds `[defaults] architectures = ["amd64"]`.
+`amd64`). A suite that lies inside another suite of that mirror (`stable`
+and `stable/updates`) goes to a separate mirror instead, since publishing
+the outer suite replaces its whole directory. A `deb-src` line joins a
+mirror of its URL, whatever its options, and turns on `indexes.sources`.
+When one URL ends up in several mirrors, each downloads its own copy of
+the pool; a comment in each of them and a warning say so (one keyring
+file for all lines avoids a split by keyring). If a mirror ends up with
+no architecture, the output adds `[defaults] architectures = ["amd64"]`.
 
-Mirror names come from the URL (see [single-mirror mode](#single-mirror-mode));
-a name already taken gets the first free `-2`, `-3`, ... suffix.
+Mirror names come from the URL (see [single-mirror mode](#single-mirror-mode)),
+cut to at most 255 bytes; a name already taken gets the first free `-2`,
+`-3`, ... suffix.
 
 A `mirror_path` prefix is compared with each mirror URL as a URL: scheme
 and host ignore case, a default port equals no port, and the path must
@@ -588,16 +622,20 @@ as a `# mirror_path ... not applied: <reason>` comment (in the mirror's
 block or under `[global]`) and as a warning on stderr; the mirror keeps
 its default path.
 
-Some lines cannot be converted: flat repositories (a suite that is `.` or
-ends in `/`, such as `./` or `stable/`, [not supported](#not-supported-flat-repositories)),
-URLs other than `http`/`https`, lines without components, suites that
-would leave the mirror directory (such as `../../etc`), and control
-characters in a suite, component or architecture. They are copied
-into a comment block at the end of the output, grouped by reason, a
-warning naming each line number goes to stderr, and the rest of the file
-is converted as usual. In a build without OpenPGP support, `signed-by=`
-becomes a comment instead of a `[mirror.verify]` block. The output always
-passes `tain check`; still, read it before use.
+A component outside `A-Z a-z 0-9 . _ + ~ -`, such as
+`main/debian-installer` (use `indexes.debian_installer = true` instead),
+is dropped from its line with a warning; the rest of the line converts.
+Some lines cannot be converted at all: flat repositories (a suite that is
+`.` or ends in `/`, such as `./` or `stable/`, [not supported](#not-supported-flat-repositories)),
+URLs other than `http`/`https`, URLs with a `?query` or `#fragment`,
+lines without a valid component, a suite outside `A-Z a-z 0-9 . _ + ~ - /`
+or an architecture outside `A-Z a-z 0-9 . _ + ~ -`, suites that would
+leave the mirror directory (such as `../../etc`), and the option cases
+above. They are copied into a comment block at the end of the output,
+grouped by reason, a warning naming each line number goes to stderr, and
+the rest of the file is converted as usual. Dropped components and
+ignored options are listed in a `# Partly converted:` block. The output
+always passes `tain check`; still, read it before use.
 
 ## On-disk layout
 

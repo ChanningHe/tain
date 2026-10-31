@@ -27,9 +27,22 @@ pub(crate) fn toml_string_list(v: &[String]) -> String {
     format!("[{}]", items.join(", "))
 }
 
+/// Text for a TOML comment: control characters other than tab, which
+/// comments may not contain, become `?`.
+pub(crate) fn comment_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\t' { '?' } else { c })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_text_replaces_control_characters() {
+        assert_eq!(comment_safe("a\tb\u{7}c\nd"), "a\tb?c?d");
+    }
 
     #[test]
     fn escapes_quotes_backslashes_and_every_control_character() {

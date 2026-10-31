@@ -790,7 +790,10 @@ pub fn is_apt_value(value: &str, is_suite: bool) -> bool {
     apt_value_problem(value, is_suite).is_none()
 }
 
-fn apt_value_problem(value: &str, is_suite: bool) -> Option<&'static str> {
+/// Why `value` is not a valid suite, component or architecture (see
+/// [`is_apt_value`]), as a phrase that follows the value.
+#[must_use]
+pub fn apt_value_problem(value: &str, is_suite: bool) -> Option<&'static str> {
     let is_allowed =
         |c: char| c.is_ascii_alphanumeric() || "._+~-".contains(c) || (is_suite && c == '/');
     if !is_suite && value.ends_with("/debian-installer") {
@@ -845,18 +848,26 @@ fn check_keyring(m: &MirrorConfig) -> Result<(), ConfigError> {
     let Some(path) = &m.verify.keyring else {
         return Ok(());
     };
-    let reason = if has_control_chars(&path.to_string_lossy()) {
-        "must not contain control characters"
+    match keyring_path_problem(path) {
+        None => Ok(()),
+        Some(reason) => Err(ConfigError::InvalidKeyring {
+            mirror: m.name.clone(),
+            path: path.clone(),
+            reason,
+        }),
+    }
+}
+
+/// Why `path` cannot be `verify.keyring`, as a phrase that follows it.
+#[must_use]
+pub fn keyring_path_problem(path: &Path) -> Option<&'static str> {
+    if has_control_chars(&path.to_string_lossy()) {
+        Some("must not contain control characters")
     } else if !path.is_absolute() {
-        "must be an absolute path"
+        Some("must be an absolute path")
     } else {
-        return Ok(());
-    };
-    Err(ConfigError::InvalidKeyring {
-        mirror: m.name.clone(),
-        path: path.clone(),
-        reason,
-    })
+        None
+    }
 }
 
 /// Lexically normalize a mirror path: drop `.` components and reject

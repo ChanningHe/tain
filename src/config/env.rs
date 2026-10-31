@@ -727,7 +727,7 @@ pub fn derive_name_from_url(url: &Url) -> String {
 }
 
 /// First `max` bytes of an ASCII slug, without a trailing `-`.
-fn truncate_slug(slug: &str, max: usize) -> &str {
+pub(crate) fn truncate_slug(slug: &str, max: usize) -> &str {
     slug.get(..max).unwrap_or(slug).trim_end_matches('-')
 }
 

@@ -133,7 +133,8 @@ pub fn unsafe_suite_reason(url: &url::Url, suite: &str) -> Option<String> {
 /// The first `(outer, inner)` pair whose suite directories nest. Each suite
 /// is published by swapping its whole directory, which would take a nested
 /// suite's published files with it. Call after the unsafe-path check.
-fn nested_suite_pair<'a>(url: &url::Url, suites: &'a [String]) -> Option<(&'a str, &'a str)> {
+#[must_use]
+pub fn nested_suite_pair<'a>(url: &url::Url, suites: &'a [String]) -> Option<(&'a str, &'a str)> {
     let dirs: Vec<(PathBuf, &str)> = suites
         .iter()
         .filter_map(|s| {
