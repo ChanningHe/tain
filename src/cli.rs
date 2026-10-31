@@ -14,7 +14,9 @@ use clap::{Args, Parser, Subcommand};
 )]
 pub struct Cli {
     /// Path to the TOML config file (overrides `TAIN_CONFIG`).
-    #[arg(long, global = true, env = "TAIN_CONFIG")]
+    // `TAIN_CONFIG` is read by the config loader, which treats an empty value
+    // as unset; clap's `env` would reject it as a missing `--config` value.
+    #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -43,7 +45,8 @@ pub struct SyncArgs {
     /// Restrict the run to specific mirrors by name (repeatable).
     #[arg(long = "mirror", value_name = "NAME")]
     pub mirrors: Vec<String>,
-    /// Plan and log the diff without downloading or publishing.
+    /// Fetch Release files and the indexes the plan needs, print the plan;
+    /// download no pool files and publish nothing.
     #[arg(long)]
     pub dry_run: bool,
     /// Log GC candidates without deleting anything.

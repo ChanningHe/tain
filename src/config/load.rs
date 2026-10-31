@@ -2,7 +2,8 @@
 //!
 //! Primary source precedence: `--config` > `TAIN_CONFIG` > default path (if it
 //! exists) > `TAIN_URL` + `TAIN_DISTS` single-source mode > `NoSource`.
-//! `TAIN_*` globals then override whichever was chosen. Legacy variable names
+//! An empty `TAIN_CONFIG` counts as unset. `TAIN_*` globals then override
+//! whichever was chosen. Legacy variable names and unknown `TAIN_*` names
 //! only trigger a `warn!`; they never affect config.
 
 use std::path::{Path, PathBuf};
@@ -55,6 +56,9 @@ pub enum LoadError {
 pub fn load(opts: LoadOptions<'_>) -> Result<(Config, LoadMode), LoadError> {
     for w in env::detect_legacy(opts.env) {
         tracing::warn!("{}", w.message());
+    }
+    for u in env::detect_unknown(opts.env) {
+        tracing::warn!("{}", u.message());
     }
 
     // An explicit path that is missing is an I/O error, never a silent fallthrough.
@@ -127,7 +131,6 @@ fn build_from_single_source(single: EnvSingleSource) -> Result<Config, LoadError
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::Write;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -168,10 +171,8 @@ mod tests {
         assert_eq!(mode, LoadMode::EnvSingleSource);
         assert_eq!(cfg.global.parallel, 8);
         assert_eq!(cfg.mirrors.len(), 1);
-        assert_eq!(
-            cfg.mirrors[0].backend_options_apt().unwrap().suites,
-            vec!["bookworm"]
-        );
+        let crate::config::model::BackendOptions::Apt(apt) = &cfg.mirrors[0].backend_options;
+        assert_eq!(apt.suites, vec!["bookworm"]);
     }
 
     fn load_env_only(pairs: &[(&str, &str)]) -> Result<(Config, LoadMode), LoadError> {
@@ -570,18 +571,5 @@ mod tests {
         let p = base.join(format!("tain-test-{pid}-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
-    }
-
-    // Keeps the `Write` import used.
-    #[allow(dead_code)]
-    fn _touch(_w: &mut dyn Write) {}
-
-    #[allow(dead_code)]
-    impl super::super::model::MirrorConfig {
-        fn backend_options_apt(&self) -> Option<&super::super::model::AptOptions> {
-            match &self.backend_options {
-                super::super::model::BackendOptions::Apt(a) => Some(a),
-            }
-        }
     }
 }

@@ -17,12 +17,16 @@ use super::model::{
     PartialVerifyConfig, PgpMode, RetryConfig, TimeoutConfig, resolve_mirror,
 };
 
-/// Parse a TOML string into a fully resolved `Config`.
+/// Parse a TOML string into a `Config` with `[defaults]` merged into every
+/// mirror, and run the target-independent mirror checks
+/// (`Config::validate_mirrors`). Global ranges, the target and the backend
+/// rules are checked by `load` once env overrides are applied.
 ///
 /// # Errors
 ///
 /// `TomlParse` for bad syntax or shape (including unknown fields), `Invalid`
-/// for an out-of-range value, `Model` for model-level rejections.
+/// for a value this parser cannot convert, `Model` for mirror-level
+/// rejections.
 pub fn parse(text: &str) -> Result<Config, TomlError> {
     let raw: TomlRoot = toml::from_str(text).map_err(|e| TomlError::TomlParse(e.to_string()))?;
 

@@ -25,6 +25,10 @@ pub const DEFAULT_SEGMENTS_PER_FILE: usize = 4;
 /// burden the upstream.
 pub const MAX_SEGMENTS_PER_FILE: usize = 8;
 
+/// Longest file name, in bytes, that common filesystems accept (`NAME_MAX`).
+/// Bounds mirror names and each component of a mirror path.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
 pub const DEFAULT_RETRY_COUNT: u32 = 3;
 
 /// Covers both the metadata phase and the Release recheck loop.
@@ -592,6 +596,11 @@ pub enum ConfigError {
     #[error("mirror name {0:?} must not contain control characters")]
     InvalidName(String),
     #[error(
+        "mirror name {name:?} is {} bytes long; the limit is {MAX_FILE_NAME_BYTES} bytes",
+        name.len()
+    )]
+    NameTooLong { name: String },
+    #[error(
         "the configuration defines no mirrors; add a [[mirror]] block or set TAIN_URL + \
          TAIN_DISTS"
     )]
@@ -632,12 +641,36 @@ pub enum ConfigError {
     },
     #[error("mirror `{mirror}`: url `{url}` must use http or https")]
     UnsupportedScheme { mirror: String, url: String },
+    // The query may carry a token, so the message never echoes the URL.
+    #[error(
+        "mirror `{mirror}`: url must not have a query (`?...`) or fragment (`#...`); tain \
+         requests paths below the url and would drop them"
+    )]
+    UrlQueryOrFragment { mirror: String },
+    #[error("mirror `{mirror}`: {field} value {value:?} {reason}")]
+    InvalidAptValue {
+        mirror: String,
+        field: &'static str,
+        value: String,
+        reason: &'static str,
+    },
+    #[error("mirror `{mirror}`: verify.keyring {path:?} {reason}")]
+    InvalidKeyring {
+        mirror: String,
+        path: PathBuf,
+        reason: &'static str,
+    },
+    #[error(
+        "`global.user_agent` / `TAIN_USER_AGENT` value {0:?} is not a valid HTTP header value \
+         (control characters are not allowed)"
+    )]
+    InvalidUserAgent(String),
     /// Rejected by the backend's `validate_config`.
     #[error("{0}")]
     Backend(String),
     #[error(
-        "segments_per_file (`TAIN_SEGMENTS`) must be between 1 and {MAX_SEGMENTS_PER_FILE}, \
-         got {0}"
+        "`global.segments_per_file` / `TAIN_SEGMENTS` must be between 1 and \
+         {MAX_SEGMENTS_PER_FILE}, got {0}"
     )]
     InvalidSegments(usize),
 }
@@ -653,6 +686,11 @@ impl Config {
         if !(1..=MAX_SEGMENTS_PER_FILE).contains(&segments) {
             return Err(ConfigError::InvalidSegments(segments));
         }
+        // The same check the HTTP client builder applies, moved to load time.
+        let user_agent = &self.global.user_agent;
+        if reqwest::header::HeaderValue::from_str(user_agent).is_err() {
+            return Err(ConfigError::InvalidUserAgent(user_agent.clone()));
+        }
         self.validate_mirrors()
     }
 
@@ -664,9 +702,10 @@ impl Config {
         Ok(())
     }
 
-    /// Unique, printable names, http(s) URLs, and mirror paths that stay
-    /// inside the target without sharing or nesting. Target-independent, so
-    /// a source can check it before env overrides are applied.
+    /// Unique, printable names, http(s) URLs without query or fragment,
+    /// absolute keyrings, and mirror paths that stay inside the target
+    /// without sharing or nesting. Target-independent, so a source can check
+    /// it before env overrides are applied.
     pub fn validate_mirrors(&self) -> Result<(), ConfigError> {
         let mut seen = std::collections::BTreeSet::new();
         let mut paths: Vec<(PathBuf, &str)> = Vec::with_capacity(self.mirrors.len());
@@ -674,16 +713,17 @@ impl Config {
             if has_control_chars(&m.name) {
                 return Err(ConfigError::InvalidName(m.name.clone()));
             }
+            if m.name.len() > MAX_FILE_NAME_BYTES {
+                return Err(ConfigError::NameTooLong {
+                    name: m.name.clone(),
+                });
+            }
             check_apt_fields(m)?;
             if !seen.insert(m.name.as_str()) {
                 return Err(ConfigError::DuplicateName(m.name.clone()));
             }
-            if !matches!(m.url.scheme(), "http" | "https") {
-                return Err(ConfigError::UnsupportedScheme {
-                    mirror: m.name.clone(),
-                    url: m.url.to_string(),
-                });
-            }
+            check_url(m)?;
+            check_keyring(m)?;
             let path =
                 normalize_mirror_path(&m.path).map_err(|reason| ConfigError::InvalidPath {
                     mirror: m.name.clone(),
@@ -703,15 +743,17 @@ pub fn has_control_chars(s: &str) -> bool {
     s.chars().any(char::is_control)
 }
 
-/// Suites, components and architectures become directory names.
+/// Suites, components and architectures become directory names and URL
+/// path segments, so they are limited to the characters apt archives use.
+/// Only suites may contain `/` (`stable/updates`).
 fn check_apt_fields(m: &MirrorConfig) -> Result<(), ConfigError> {
     let BackendOptions::Apt(apt) = &m.backend_options;
     let fields = [
-        ("suites", &apt.suites),
-        ("components", &apt.components),
-        ("architectures", &apt.architectures),
+        ("suites", &apt.suites, true),
+        ("components", &apt.components, false),
+        ("architectures", &apt.architectures, false),
     ];
-    for (field, values) in fields {
+    for (field, values, is_suite) in fields {
         if let Some(value) = values.iter().find(|v| has_control_chars(v)) {
             return Err(ConfigError::ControlChars {
                 mirror: m.name.clone(),
@@ -719,13 +761,79 @@ fn check_apt_fields(m: &MirrorConfig) -> Result<(), ConfigError> {
                 value: value.clone(),
             });
         }
+        if let Some(value) = values.iter().find(|v| !is_apt_value(v, is_suite)) {
+            return Err(ConfigError::InvalidAptValue {
+                mirror: m.name.clone(),
+                field,
+                value: value.clone(),
+                reason: if is_suite {
+                    "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ - /`"
+                } else {
+                    "must be non-empty and use only `A-Z a-z 0-9 . _ + ~ -`"
+                },
+            });
+        }
     }
     Ok(())
 }
 
+/// Whether `value` is a valid suite (`is_suite`), component or architecture:
+/// non-empty, from `[A-Za-z0-9._+~-]`, plus `/` in suites.
+#[must_use]
+pub fn is_apt_value(value: &str, is_suite: bool) -> bool {
+    let is_allowed =
+        |c: char| c.is_ascii_alphanumeric() || "._+~-".contains(c) || (is_suite && c == '/');
+    !value.is_empty() && value.chars().all(is_allowed)
+}
+
+/// Whether `url` has a non-empty query or fragment. Requests are built by
+/// joining paths onto the url, which drops both.
+#[must_use]
+pub fn has_query_or_fragment(url: &Url) -> bool {
+    let is_set = |part: Option<&str>| part.is_some_and(|s| !s.is_empty());
+    is_set(url.query()) || is_set(url.fragment())
+}
+
+/// http(s) only, with nothing that requests would silently drop.
+fn check_url(m: &MirrorConfig) -> Result<(), ConfigError> {
+    if !matches!(m.url.scheme(), "http" | "https") {
+        return Err(ConfigError::UnsupportedScheme {
+            mirror: m.name.clone(),
+            url: m.url.to_string(),
+        });
+    }
+    if has_query_or_fragment(&m.url) {
+        return Err(ConfigError::UrlQueryOrFragment {
+            mirror: m.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The keyring is read at sync time from whatever the working directory
+/// is then, and its path ends up in error messages.
+fn check_keyring(m: &MirrorConfig) -> Result<(), ConfigError> {
+    let Some(path) = &m.verify.keyring else {
+        return Ok(());
+    };
+    let reason = if has_control_chars(&path.to_string_lossy()) {
+        "must not contain control characters"
+    } else if !path.is_absolute() {
+        "must be an absolute path"
+    } else {
+        return Ok(());
+    };
+    Err(ConfigError::InvalidKeyring {
+        mirror: m.name.clone(),
+        path: path.clone(),
+        reason,
+    })
+}
+
 /// Lexically normalize a mirror path: drop `.` components and reject
-/// anything absolute, climbing with `..`, naming the target itself, or
-/// containing control characters (NUL truncates C paths; others garble logs).
+/// anything absolute, climbing with `..`, naming the target itself,
+/// containing control characters (NUL truncates C paths; others garble logs)
+/// or a component longer than a file name may be.
 ///
 /// # Errors
 ///
@@ -736,6 +844,9 @@ pub fn normalize_mirror_path(path: &Path) -> Result<PathBuf, &'static str> {
         match c {
             Component::Normal(part) if has_control_chars(&part.to_string_lossy()) => {
                 return Err("must not contain control characters");
+            }
+            Component::Normal(part) if part.len() > MAX_FILE_NAME_BYTES => {
+                return Err("has a component longer than 255 bytes");
             }
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
@@ -1450,6 +1561,112 @@ mod tests {
                 "{url}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_limits_name_and_path_components_to_a_file_name() {
+        let at_limit = "n".repeat(MAX_FILE_NAME_BYTES);
+        cfg_with("/data", &[(&at_limit, URL, None)])
+            .validate()
+            .unwrap();
+        let too_long = "n".repeat(MAX_FILE_NAME_BYTES + 1);
+        let err = cfg_with("/data", &[(&too_long, URL, Some("short"))])
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::NameTooLong { .. }), "{err:?}");
+        // Multi-byte characters count in bytes.
+        let wide = "é".repeat(128);
+        let err = cfg_with("/data", &[("d", URL, Some(&format!("a/{wide}")))])
+            .validate()
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidPath { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn apt_values_use_the_apt_character_set() {
+        for ok in [
+            "bookworm-backports",
+            "stable/updates",
+            "v1.0~rc1+b2",
+            "non_free",
+        ] {
+            assert!(is_apt_value(ok, true), "{ok}");
+        }
+        for ok in ["main", "pve-no-subscription", "hurd-i386", "14"] {
+            assert!(is_apt_value(ok, false), "{ok}");
+        }
+        for bad in ["", "main#x", "con trib", "a?b", "a%2f", "ä", "a:b"] {
+            assert!(!is_apt_value(bad, true), "{bad}");
+        }
+        assert!(!is_apt_value("non/free", false));
+    }
+
+    #[test]
+    fn validate_rejects_apt_values_outside_the_character_set() {
+        let mut cfg = cfg_with("/data", &[("d", URL, None)]);
+        let BackendOptions::Apt(apt) = &mut cfg.mirrors[0].backend_options;
+        apt.components = vec!["main".to_owned(), "main#x".to_owned()];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidAptValue { field: "components", value, .. }
+                if value == "main#x"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_url_query_or_fragment_without_echoing_it() {
+        for url in [
+            "https://example.com/d?token=SECRET",
+            "https://example.com/d#SECRET",
+        ] {
+            let err = cfg_with("/data", &[("d", url, None)])
+                .validate()
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::UrlQueryOrFragment { .. }),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains("SECRET"), "{err}");
+        }
+        cfg_with("/data", &[("d", "https://example.com/d?#", None)])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_requires_an_absolute_keyring_without_control_characters() {
+        for (keyring, needle) in [
+            ("keys/a.gpg", "absolute"),
+            ("0123456789ABCDEF0123456789ABCDEF01234567", "absolute"),
+            ("/etc/key\u{7}ring.gpg", "control"),
+        ] {
+            let mut cfg = cfg_with("/data", &[("d", URL, None)]);
+            cfg.mirrors[0].verify.keyring = Some(PathBuf::from(keyring));
+            let err = cfg.validate().unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidKeyring { .. }), "{msg}");
+            assert!(msg.contains(needle) && !has_control_chars(&msg), "{msg}");
+        }
+        let mut cfg = cfg_with("/data", &[("d", URL, None)]);
+        cfg.mirrors[0].verify.keyring = Some(PathBuf::from("/etc/apt/keyrings/a.gpg"));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_user_agent_that_is_not_a_header_value() {
+        for ua in ["a\u{1}b", "tain\r\nX-Injected: 1", "a\u{7f}"] {
+            let mut cfg = cfg_with("/data", &[]);
+            cfg.global.user_agent = ua.to_owned();
+            let err = cfg.validate().unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidUserAgent(_)), "{msg}");
+            assert!(msg.contains("global.user_agent") && msg.contains("TAIN_USER_AGENT"));
+            assert!(!has_control_chars(&msg), "{msg}");
+        }
+        let mut cfg = cfg_with("/data", &[]);
+        cfg.global.user_agent = "tain/1.0 (+https://example.com)".to_owned();
+        cfg.validate().unwrap();
     }
 
     #[test]

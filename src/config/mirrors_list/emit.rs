@@ -12,7 +12,9 @@ use super::mirror_paths::{self, canonical};
 use super::{DebEntry, DebKind, Entry};
 use crate::backends::apt::unsafe_suite_reason;
 use crate::config::env::derive_name_from_url;
-use crate::config::model::{has_control_chars, is_flat_suite, normalize_mirror_path};
+use crate::config::model::{
+    has_control_chars, has_query_or_fragment, is_apt_value, is_flat_suite, normalize_mirror_path,
+};
 
 /// Default architecture for lines that declare none (also `[defaults]`).
 const DEFAULT_ARCH: &str = "amd64";
@@ -35,6 +37,16 @@ pub fn skip_reason(d: &DebEntry) -> Option<&'static str> {
         .any(|s| has_control_chars(s))
     {
         Some("a suite, component or architecture contains control characters")
+    } else if !is_apt_value(&d.suite, true)
+        || !d
+            .components
+            .iter()
+            .chain(d.arch_override.iter().flatten())
+            .all(|s| is_apt_value(s, false))
+    {
+        Some("a suite, component or architecture contains characters apt archives do not use")
+    } else if has_query_or_fragment(&d.url) {
+        Some("the URL has a query or fragment, which tain cannot request")
     } else if unsafe_suite_reason(&d.url, &d.suite).is_some() {
         Some("the suite does not stay inside the mirror")
     } else {

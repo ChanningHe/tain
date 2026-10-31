@@ -35,7 +35,7 @@ applies environment overrides on top. The primary source is the first of
 these that applies:
 
 1. `--config <path>` on the command line.
-2. `TAIN_CONFIG=<path>` in the environment.
+2. `TAIN_CONFIG=<path>` in the environment. An empty value counts as unset.
 3. `/etc/tain/config.toml`, if that file exists.
 4. Single-mirror mode, if `TAIN_URL` is set (see [below](#single-mirror-mode)).
 5. Otherwise `tain` exits with code 2.
@@ -56,20 +56,26 @@ variable names from older mirror scripts (`APTSYNC_URL`, `APTSYNC_DISTS`,
 `APTSYNC_UNLINK`, `APTSYNC_USER_AGENT`, `TO`, `CRON`, `PARALLEL_DOWNLOADS`)
 are detected and produce a warning naming the `TAIN_*` replacement; they
 have no effect. `TAIN_LOG_FILE` is not supported either (logs always go to
-stderr); setting it only produces a warning.
+stderr); setting it only produces a warning. Any other `TAIN_*` variable
+that `tain` does not read, such as a misspelled `TAIN_PARALEL`, produces a
+warning naming the closest known variable; it has no effect either.
 
 `tain daemon` re-reads the configuration from the same source on `SIGHUP`.
 If the new configuration fails to load, has no valid `schedule` or defines
 no mirrors, the daemon logs a warning and keeps running with the previous
 one.
 
-Loading validates the whole configuration, including the backend's rules
-(at least one component, safe suite names, `pgp = "required"` only in a
+Loading validates the whole configuration: value ranges, the `user_agent`
+header value, mirror names and paths (including the 255-byte limit per
+file name), URLs, keyring paths, the characters allowed in suites,
+components and architectures, and the backend's rules (at least one
+component, safe and non-nested suite names, `pgp = "required"` only in a
 build with signature support). Every command except `import` runs this
-validation; a failure exits 2. `tain check` also validates `schedule`. It does not
-read keyring files (a missing or unreadable keyring fails the suite at
-sync time) and accepts a configuration with no mirrors, which every other
-command rejects with exit code 2.
+validation; a failure exits 2. `tain check` also validates `schedule`. It
+makes no network requests and does not read keyring files (a missing or
+unreadable keyring fails the suite at sync time), and it accepts a
+configuration with no mirrors, which every other command rejects with exit
+code 2.
 
 ## Value formats
 
@@ -111,7 +117,7 @@ block, then `[defaults]`, then the built-in default.
 | `connect_timeout` | duration > 0 | `"30s"` | Connect timeout for upstream connections. There is no whole-request timeout. |
 | `idle_timeout` | duration > 0 | `"60s"` | Longest wait for response headers and for each body read; a download that receives no bytes for this long is aborted. Also the idle timeout for pooled HTTP connections. See [Stalled and slow transfers](#stalled-and-slow-transfers). |
 | `bind_address` | IP address | unset | Local source address for outgoing connections. |
-| `user_agent` | string | `"tain/<version>"` | HTTP `User-Agent`. |
+| `user_agent` | string | `"tain/<version>"` | HTTP `User-Agent`. Must be a valid HTTP header value: control characters are rejected (exit code 2). |
 | `schedule` | cron | unset | Sync schedule for `tain daemon`. Required by `daemon`; ignored by `sync`. Validated by `check` and when the daemon starts or reloads; an expression that never fires, such as `"0 0 30 2 *"`, is rejected. |
 | `lock_timeout` | duration | `"0s"` | How long `sync` waits for another process holding a mirror's lock. `0s` fails immediately. |
 | `segment_min_size` | size | `"256MiB"` | Files at least this large are fetched with parallel range requests when the upstream supports `Range`; smaller files use one request. TOML only. |
@@ -169,13 +175,13 @@ gc = { enabled = true, grace_period = "72h" }
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | required | Unique identifier, used in logs, metrics, `--mirror` filters and as the default `path` (so it must then follow the `path` rules). |
-| `url` | URL | required | Repository root, i.e. the URL a client would put in `sources.list` (`https://deb.debian.org/debian`). Must be `http` or `https`. |
+| `name` | string | required | Unique identifier, used in logs, metrics, `--mirror` filters and as the default `path` (so it must then follow the `path` rules). At most 255 bytes, no control characters. |
+| `url` | URL | required | Repository root, i.e. the URL a client would put in `sources.list` (`https://deb.debian.org/debian`). Must be `http` or `https`, without a query (`?...`) or fragment (`#...`): requests are made for paths below the URL, so neither could be sent. The error does not repeat the URL. |
 | `backend` | `"apt"` | `"apt"` | Repository format. `apt` is the only backend. |
-| `path` | path | `name` | Directory under `global.target`. Must be relative, must not contain `..` and must not be empty or `.`. Two mirrors may not use the same directory, and one mirror's directory may not lie inside another's (`debian` and `debian/pve` conflict; `debian` and `debian-security` do not). |
-| `suites` | list of strings | required | Suites to mirror, e.g. `["trixie", "trixie-updates"]`. Slash suites such as `"stable/updates"` work. Flat repositories are [not supported](#not-supported-flat-repositories). Must not be empty. |
-| `components` | list of strings | `[]` | Components, e.g. `["main", "contrib"]`. Set at least one; an empty list is rejected when the configuration is loaded. |
-| `architectures` | list of strings | required | Binary architectures, e.g. `["amd64", "arm64"]`. Architecture `all` is included implicitly. Must not be empty. |
+| `path` | path | `name` | Directory under `global.target`. Must be relative, must not contain `..` must not be empty or `.`, and no component may be longer than 255 bytes. Two mirrors may not use the same directory, and one mirror's directory may not lie inside another's (`debian` and `debian/pve` conflict; `debian` and `debian-security` do not). |
+| `suites` | list of strings | required | Suites to mirror, e.g. `["trixie", "trixie-updates"]`. Slash suites such as `"stable/updates"` work, but a suite may not lie inside another suite of the same mirror (`stable` and `stable/updates`): publishing the outer suite replaces its whole directory. Put such suites in separate mirrors with separate paths. Flat repositories are [not supported](#not-supported-flat-repositories). Must not be empty. Each suite uses only `A-Z a-z 0-9 . _ + ~ - /`. |
+| `components` | list of strings | `[]` | Components, e.g. `["main", "contrib"]`. Set at least one; an empty list is rejected when the configuration is loaded. Each component uses only `A-Z a-z 0-9 . _ + ~ -`. |
+| `architectures` | list of strings | required | Binary architectures, e.g. `["amd64", "arm64"]`. Architecture `all` is included implicitly. Must not be empty. Each architecture uses only `A-Z a-z 0-9 . _ + ~ -`. |
 | `create_suite_symlinks` | bool | `true` | Create the `dists/<Suite>` to `dists/<Codename>` symlink (for example `stable -> trixie`) when the Release file names both. |
 | `force_http1` | bool | `false` | Use HTTP/1.1 only for this mirror. By default HTTP/2 is negotiated when the server offers it. Not available in `[defaults]`. |
 
@@ -202,7 +208,7 @@ index.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `pgp` | `"off"` \| `"if-present"` \| `"required"` | `"off"` | OpenPGP check of `InRelease`, or of `Release` + `Release.gpg`. `off`: never check. `if-present`: check when a signature exists, a bad signature fails the suite; see [Signatures](#signatures) for the downgrade rule. `required`: a missing or bad signature fails the suite. |
-| `keyring` | path | unset | Keyring holding the upstream signing keys: binary (`.gpg`), ASCII-armored (`.asc`), or several armored blocks concatenated (`cat a.asc b.asc`). Required whenever `pgp` is not `off`; without it the configuration is rejected (exit code 2). The file itself is read at sync time; a missing or unreadable keyring fails the suite. An empty string counts as unset, so a mirror with `keyring = ""` inherits the `[defaults]` keyring. |
+| `keyring` | path | unset | Keyring holding the upstream signing keys: binary (`.gpg`), ASCII-armored (`.asc`), or several armored blocks concatenated (`cat a.asc b.asc`). Required whenever `pgp` is not `off`; without it the configuration is rejected (exit code 2). Must be an absolute path without control characters. The file itself is read at sync time; a missing or unreadable keyring fails the suite. An empty string counts as unset, so a mirror with `keyring = ""` inherits the `[defaults]` keyring. |
 | `allow_weak_hash` | bool | `false` | Accept index entries that carry only MD5 or SHA-1 checksums. When `false`, a `Packages` or `Sources` entry with only weak checksums fails the suite, and the error names the index and some of the entries; `Release` entries with only weak checksums are dropped with a warning. |
 
 `pgp = "required"` needs a build with the `pgp` cargo feature (on by
@@ -317,7 +323,7 @@ These apply in both TOML and single-mirror mode and replace the matching
 
 | Variable | Overrides | Notes |
 |---|---|---|
-| `TAIN_CONFIG` | | Path to the TOML file. Same as `--config`, which wins if both are set. |
+| `TAIN_CONFIG` | | Path to the TOML file. Same as `--config`, which wins if both are set. An empty value counts as unset. |
 | `TAIN_TARGET` | `target` | |
 | `TAIN_PARALLEL` | `parallel` | integer > 0 |
 | `TAIN_HOST_CONNECTIONS` | `host_connections` | integer > 0 |
@@ -355,7 +361,10 @@ deployments. The backend is always `apt`.
 | `TAIN_GC_KEEP_GENERATIONS` | no | `3` | `gc.keep_generations`. |
 
 The mirror name is derived from the URL: host and path, lowercased, with
-every character outside `[a-z0-9._-]` replaced by `-`. For
+every character outside `[a-z0-9._-]` replaced by `-`, runs of `-`
+collapsed into one and leading or trailing `-` removed (`mirror` if
+nothing is left). The result is cut to 255 bytes; with several groups, the
+`-<n>` suffix fits within that limit. For
 `http://download.proxmox.com/debian/pve` that is
 `download.proxmox.com-debian-pve`. The directory defaults to the name, so
 set `TAIN_PATH` for a shorter one. With several `TAIN_DISTS` groups, each
@@ -596,7 +605,7 @@ rename on one filesystem. Exclude `.tain/` from your web server.
 |---|---|
 | 0 | Success. |
 | 1 | At least one mirror or suite failed (`sync`); problems found (`verify`); a mirror is unhealthy or its state is unreadable (`status`). |
-| 2 | Configuration error: no source, invalid TOML or environment value, `verify.pgp` without `verify.keyring`, a flat-repository suite, no components, an unsafe suite name, an empty or relative `target`, an invalid or overlapping mirror `path`, a non-http(s) `url`, `segments_per_file` outside `1`..`8`, invalid log level or format, missing, invalid or never-firing `schedule` (`check`, `daemon`), no mirrors configured (`sync`, `verify`, `status`, `daemon`), an unknown `--mirror` name, bad `--healthy-within`, unparseable `mirror.list`. |
+| 2 | Configuration error: no source, invalid TOML or environment value, `verify.pgp` without `verify.keyring`, a flat-repository suite, no components, an unsafe suite name, an empty or relative `target`, a mirror name or `path` component longer than 255 bytes, an invalid or overlapping mirror `path`, a non-http(s) `url` or one with a query or fragment, a relative `verify.keyring`, a suite, component or architecture with characters outside the allowed set, nested suites, a `user_agent` that is not a valid header value, `segments_per_file` outside `1`..`8`, invalid log level or format, missing, invalid or never-firing `schedule` (`check`, `daemon`), no mirrors configured (`sync`, `verify`, `status`, `daemon`), an unknown `--mirror` name, bad `--healthy-within`, unparseable `mirror.list`. |
 | 3 | Lock contention: every selected mirror failed and at least one because another process held its lock (`sync`). |
 | 4 | Fatal I/O: unreadable config file, unwritable target, disk full. |
 

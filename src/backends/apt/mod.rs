@@ -15,6 +15,8 @@ pub mod pgp;
 pub mod release;
 pub mod sources;
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 
 use crate::config::model::{BackendOptions, MirrorConfig, PgpMode};
@@ -101,6 +103,15 @@ impl Backend for AptBackend {
             }
         }
 
+        if let Some((outer, inner)) = nested_suite_pair(&mirror.url, &apt.suites) {
+            return Err(BackendError::Config(format!(
+                "mirror `{}`: suite {inner:?} lies inside suite {outer:?}; publishing {outer:?} \
+                 replaces its whole directory and would drop {inner:?} — mirror them as \
+                 separate mirrors with separate paths",
+                mirror.name,
+            )));
+        }
+
         Ok(())
     }
 
@@ -117,6 +128,26 @@ pub fn unsafe_suite_reason(url: &url::Url, suite: &str) -> Option<String> {
         .suite_rel("InRelease")
         .err()
         .map(|e| e.to_string())
+}
+
+/// The first `(outer, inner)` pair whose suite directories nest. Each suite
+/// is published by swapping its whole directory, which would take a nested
+/// suite's published files with it. Call after the unsafe-path check.
+fn nested_suite_pair<'a>(url: &url::Url, suites: &'a [String]) -> Option<(&'a str, &'a str)> {
+    let dirs: Vec<(PathBuf, &str)> = suites
+        .iter()
+        .filter_map(|s| {
+            let rel = layout::SuiteLayout::new(url, s)
+                .suite_rel("InRelease")
+                .ok()?;
+            Some((rel.as_std_path().parent()?.to_path_buf(), s.as_str()))
+        })
+        .collect();
+    dirs.iter().find_map(|(inner_dir, inner)| {
+        dirs.iter()
+            .find(|(outer_dir, _)| outer_dir != inner_dir && inner_dir.starts_with(outer_dir))
+            .map(|(_, outer)| (*outer, *inner))
+    })
 }
 
 /// Flat forms `SuiteLayout::is_flat` handles: `./` or a suite ending in `/./`.
@@ -220,6 +251,47 @@ mod tests {
         let m = mirror("flat", apt, VerifyConfig::default());
         let err = AptBackend::new().validate_config(&m).unwrap_err();
         assert!(matches!(err, BackendError::Config(_)), "{err:?}");
+    }
+
+    fn suites_mirror(suites: &[&str], components: &[&str]) -> MirrorConfig {
+        let apt = AptOptions::test_new(
+            suites.iter().map(|s| (*s).to_owned()).collect(),
+            components.iter().map(|s| (*s).to_owned()).collect(),
+            vec!["amd64".to_owned()],
+        );
+        mirror("nest", apt, VerifyConfig::default())
+    }
+
+    #[test]
+    fn validate_rejects_nested_suites_in_either_order() {
+        for (suites, components) in [
+            (&["bookworm", "bookworm/updates"][..], &["main"][..]),
+            (&["stable/updates", "stable"][..], &["main"][..]),
+            (&["a", "a/b/c"][..], &["main"][..]),
+            (&["foo/./", "foo/bar/./"][..], &[][..]),
+        ] {
+            let err = AptBackend::new()
+                .validate_config(&suites_mirror(suites, components))
+                .unwrap_err();
+            assert!(
+                matches!(&err, BackendError::Config(msg) if msg.contains("lies inside suite")),
+                "{suites:?}: {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_suites_that_only_share_a_name_prefix() {
+        let m = suites_mirror(
+            &[
+                "bookworm",
+                "bookworm-updates",
+                "bookworm-security",
+                "stable/updates",
+            ],
+            &["main"],
+        );
+        AptBackend::new().validate_config(&m).unwrap();
     }
 
     #[test]

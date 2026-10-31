@@ -13,8 +13,9 @@ use url::Url;
 use crate::observe::LogFormat;
 
 use super::model::{
-    FloatRatio, GlobalConfig, I18nSelection, MirrorDefaults, PartialAptOptions, PartialGcConfig,
-    PartialIndexSelection, PartialMirror, PartialVerifyConfig, PgpMode,
+    FloatRatio, GlobalConfig, I18nSelection, MAX_FILE_NAME_BYTES, MirrorDefaults,
+    PartialAptOptions, PartialGcConfig, PartialIndexSelection, PartialMirror, PartialVerifyConfig,
+    PgpMode,
 };
 
 // ---------- EnvSource abstraction ----------
@@ -22,11 +23,21 @@ use super::model::{
 /// Read-only env lookup; tests use `HashMap`, production `ProcessEnv`.
 pub trait EnvSource {
     fn get(&self, key: &str) -> Option<String>;
+
+    /// Every variable name, used only to warn about unknown `TAIN_*` names.
+    /// A source that cannot enumerate returns nothing.
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl EnvSource for HashMap<String, String> {
     fn get(&self, key: &str) -> Option<String> {
         HashMap::get(self, key).cloned()
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.keys().cloned().collect()
     }
 }
 
@@ -36,6 +47,12 @@ pub struct ProcessEnv;
 impl EnvSource for ProcessEnv {
     fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn names(&self) -> Vec<String> {
+        std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect()
     }
 }
 
@@ -132,6 +149,97 @@ pub const SINGLE_SOURCE_ENV_NAMES: &[&str] = &[
     "TAIN_GC_MAX_DELETE_RATIO",
     "TAIN_GC_KEEP_GENERATIONS",
 ];
+
+/// Variables that apply in every mode (`TAIN_CONFIG` and the global overrides).
+pub const GLOBAL_ENV_NAMES: &[&str] = &[
+    "TAIN_CONFIG",
+    "TAIN_TARGET",
+    "TAIN_PARALLEL",
+    "TAIN_HOST_CONNECTIONS",
+    "TAIN_SEGMENTS",
+    "TAIN_CONNECT_TIMEOUT",
+    "TAIN_IDLE_TIMEOUT",
+    "TAIN_RETRY",
+    "TAIN_INDEX_RETRY",
+    "TAIN_BIND_ADDRESS",
+    "TAIN_USER_AGENT",
+    "TAIN_LOG_LEVEL",
+    "TAIN_LOG_FORMAT",
+    "TAIN_SCHEDULE",
+    "TAIN_LOCK_TIMEOUT",
+];
+
+/// An unknown `TAIN_*` variable, with the closest known name if one is near.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownVar {
+    pub name: String,
+    pub suggestion: Option<&'static str>,
+}
+
+impl UnknownVar {
+    #[must_use]
+    pub fn message(&self) -> String {
+        let name = self.name.escape_debug();
+        match self.suggestion {
+            Some(known) => format!(
+                "environment variable `{name}` is not a tain variable and has no effect — did \
+                 you mean `{known}`?"
+            ),
+            None => {
+                format!("environment variable `{name}` is not a tain variable and has no effect")
+            }
+        }
+    }
+}
+
+/// Largest edit distance at which a known name is offered as a suggestion.
+const MAX_SUGGESTION_DISTANCE: usize = 3;
+
+/// `TAIN_*` names in `env` that tain does not read (legacy and removed names
+/// excepted: `detect_legacy` reports those), sorted.
+pub fn detect_unknown(env: &dyn EnvSource) -> Vec<UnknownVar> {
+    let removed = REMOVED_ENV_NAMES.iter().map(|&(name, _)| name);
+    let known: Vec<&'static str> = GLOBAL_ENV_NAMES
+        .iter()
+        .chain(SINGLE_SOURCE_ENV_NAMES)
+        .copied()
+        .chain(removed)
+        .collect();
+    let mut names: Vec<String> = env
+        .names()
+        .into_iter()
+        .filter(|n| n.starts_with("TAIN_") && !known.contains(&n.as_str()))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let suggestion = known
+                .iter()
+                .map(|k| (edit_distance(&name, k), *k))
+                .min()
+                .filter(|(d, _)| *d <= MAX_SUGGESTION_DISTANCE)
+                .map(|(_, k)| k);
+            UnknownVar { name, suggestion }
+        })
+        .collect()
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut row = Vec::with_capacity(b.len() + 1);
+        row.push(i + 1);
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != *cb);
+            row.push(substitute.min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b.len()]
+}
 
 /// Single-mirror variables set to a non-empty value; ignored in TOML mode.
 pub fn single_source_vars_set(env: &dyn EnvSource) -> Vec<&'static str> {
@@ -488,7 +596,11 @@ pub fn try_single_source(env: &dyn EnvSource) -> Result<Option<EnvSingleSource>,
         let mirror_name = if single_group {
             name.clone()
         } else {
-            format!("{name}-{idx}")
+            let suffix = format!("-{idx}");
+            format!(
+                "{}{suffix}",
+                truncate_slug(&name, MAX_FILE_NAME_BYTES - suffix.len())
+            )
         };
         mirrors.push(PartialMirror {
             name: mirror_name,
@@ -539,7 +651,8 @@ fn read_shared_mirror_overrides(env: &dyn EnvSource) -> Result<SharedMirrorOverr
 
 // ---------- Name derivation ----------
 
-/// Slug `host-path` to `[a-z0-9._-]` with collapsed dashes; `mirror` if empty.
+/// Slug `host-path` to `[a-z0-9._-]` with collapsed dashes, cut to
+/// `MAX_FILE_NAME_BYTES`; `mirror` if empty.
 pub fn derive_name_from_url(url: &Url) -> String {
     let host = url.host_str().unwrap_or("mirror");
     let path = url.path().trim_matches('/');
@@ -566,12 +679,17 @@ pub fn derive_name_from_url(url: &Url) -> String {
             last_dash = false;
         }
     }
-    let trimmed = out.trim_matches('-').to_owned();
+    let trimmed = truncate_slug(out.trim_matches('-'), MAX_FILE_NAME_BYTES);
     if trimmed.is_empty() {
         "mirror".to_owned()
     } else {
-        trimmed
+        trimmed.to_owned()
     }
+}
+
+/// First `max` bytes of an ASCII slug, without a trailing `-`.
+fn truncate_slug(slug: &str, max: usize) -> &str {
+    slug.get(..max).unwrap_or(slug).trim_end_matches('-')
 }
 
 // ---------- primitive parsers ----------
@@ -722,6 +840,79 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn unknown_tain_names_warn_with_a_near_suggestion_only() {
+        let e = env(&[
+            ("TAIN_PARALEL", "4"),
+            ("TAIN_LOGLEVEL", "debug"),
+            ("TAIN_ZZZZZZZZZZZZ", "1"),
+            ("TAIN_PARALLEL", "4"),
+            ("TAIN_LOG_FILE", "/x"),
+            ("PATH", "/bin"),
+        ]);
+        let found = detect_unknown(&e);
+        let pairs: Vec<(&str, Option<&str>)> = found
+            .iter()
+            .map(|u| (u.name.as_str(), u.suggestion))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("TAIN_LOGLEVEL", Some("TAIN_LOG_LEVEL")),
+                ("TAIN_PARALEL", Some("TAIN_PARALLEL")),
+                ("TAIN_ZZZZZZZZZZZZ", None),
+            ]
+        );
+        assert!(found[0].message().contains("did you mean `TAIN_LOG_LEVEL`"));
+        assert!(!found[2].message().contains("did you mean"));
+    }
+
+    #[test]
+    fn unknown_name_is_escaped_in_the_message() {
+        let u = UnknownVar {
+            name: "TAIN_\u{1b}[31m".to_owned(),
+            suggestion: None,
+        };
+        assert!(!u.message().contains('\u{1b}'), "{}", u.message());
+    }
+
+    #[test]
+    fn every_known_variable_is_documented() {
+        let docs = include_str!("../../docs/configuration.md");
+        for name in GLOBAL_ENV_NAMES.iter().chain(SINGLE_SOURCE_ENV_NAMES) {
+            assert!(
+                docs.contains(&format!("`{name}`")),
+                "{name} is undocumented"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("TAIN_GC", "TAIN_GC"), 0);
+        assert_eq!(edit_distance("TAIN_PARALEL", "TAIN_PARALLEL"), 1);
+        assert_eq!(edit_distance("TAIN_SHEDULE", "TAIN_SCHEDULE"), 1);
+        assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn derived_names_fit_in_a_file_name() {
+        let long = Url::parse(&format!("http://example.com/{}", "segment/".repeat(60))).unwrap();
+        let name = derive_name_from_url(&long);
+        assert!(name.len() <= MAX_FILE_NAME_BYTES, "{}", name.len());
+        assert!(!name.ends_with('-'), "{name}");
+
+        let e = env(&[
+            ("TAIN_URL", long.as_str()),
+            ("TAIN_DISTS", "bookworm|main|amd64;trixie|main|amd64"),
+        ]);
+        let single = try_single_source(&e).unwrap().unwrap();
+        for (idx, m) in single.mirrors.iter().enumerate() {
+            assert!(m.name.len() <= MAX_FILE_NAME_BYTES, "{}", m.name.len());
+            assert!(m.name.ends_with(&format!("-{idx}")), "{}", m.name);
+        }
     }
 
     #[test]
